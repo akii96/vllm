@@ -69,6 +69,9 @@ class TopKWeightAndReduceNoOP(mk.TopKWeightAndReduce):
             f"But got output={output.size()}, "
             f"used_expert_output={fused_expert_output.size()}"
         )
+        # Skip self-copy when caller aliased fused_out to output upstream.
+        if output.data_ptr() == fused_expert_output.data_ptr():
+            return output
         output.copy_(fused_expert_output, non_blocking=True)
         return output
 

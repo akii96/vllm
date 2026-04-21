@@ -387,18 +387,48 @@ class AiterExperts(mk.FusedMoEExpertsModular):
         else:
             num_local_tokens = None
 
-        result = rocm_aiter_fused_experts(
-            hidden_states=hidden_states,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            expert_map=expert_map,
-            quant_config=self.quant_config,
-            a1q_scale=a1q_scale,
-            num_local_tokens=num_local_tokens,
-            output_dtype=output.dtype,
-        )
-        output.copy_(result)
+        # Hand AITER the caller's output buffer so its fused_moe writes directly
+        # into it (eliminates a redundant DtoD copy = Copy 1 of the double-copy
+        # MoE write-back path).
+        try:
+            from aiter.fused_moe import output_buffer_override as _aiter_buf_override
+        except ImportError:
+            _aiter_buf_override = None
+
+        if _aiter_buf_override is not None:
+            with _aiter_buf_override(output):
+                result = rocm_aiter_fused_experts(
+                    hidden_states=hidden_states,
+                    w1=w1,
+                    w2=w2,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    activation=activation,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    expert_map=expert_map,
+                    quant_config=self.quant_config,
+                    a1q_scale=a1q_scale,
+                    num_local_tokens=num_local_tokens,
+                    output_dtype=output.dtype,
+                )
+        else:
+            result = rocm_aiter_fused_experts(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                expert_map=expert_map,
+                quant_config=self.quant_config,
+                a1q_scale=a1q_scale,
+                num_local_tokens=num_local_tokens,
+                output_dtype=output.dtype,
+            )
+
+        # AITER may not have honored the override (different shape/dtype path,
+        # tkw1 path, or older aiter without the override hook). Skip the copy
+        # only when we know the buffers alias.
+        if result.data_ptr() != output.data_ptr():
+            output.copy_(result)
