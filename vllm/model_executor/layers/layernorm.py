@@ -143,6 +143,7 @@ class RMSNorm(CustomOp):
         var_hidden_size: int | None = None,
         has_weight: bool = True,
         dtype: torch.dtype | None = None,
+        fused_allreduce: bool = False,
     ) -> None:
         super().__init__()
 
@@ -156,6 +157,18 @@ class RMSNorm(CustomOp):
         self.weight = torch.ones(hidden_size, dtype=weight_dtype)
         if self.has_weight:
             self.weight = nn.Parameter(self.weight)
+
+        # When True (and TP>1), the residual-add + RMSNorm is fused with the
+        # upstream tensor-parallel all-reduce. The model is expected to set
+        # `reduce_results=False` on the linear/MoE that feeds this norm; the
+        # device communicator falls back to a plain `all_reduce +
+        # fused_add_rms_norm` when no fused kernel is available, so this is
+        # safe to enable wherever the model wires it.
+        # The TP world size is read lazily in forward() (and cached on first
+        # call) so we don't capture a stale value when RMSNorm is
+        # instantiated before TP is fully initialized (e.g. meta device).
+        self.fused_allreduce = fused_allreduce
+        self._fused_allreduce_active: bool | None = None
 
         if current_platform.is_rocm():
             aiter_rmsnorm_enabled = rocm_aiter_ops.is_rmsnorm_enabled()
@@ -372,6 +385,32 @@ class RMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
+
+        # Fold the upstream tensor-parallel all-reduce into the residual-add
+        # + RMSNorm. The communicator falls back to a plain all-reduce +
+        # fused_add_rms_norm when no fused kernel is available, so this is
+        # safe to dispatch unconditionally as long as the upstream layer was
+        # built with `reduce_results=False`.
+        if self.fused_allreduce and residual is not None:
+            if self._fused_allreduce_active is None:
+                # Resolve TP size on first call (TP may not have been
+                # initialized at __init__ time, e.g. meta-device init).
+                from vllm.distributed import get_tensor_model_parallel_world_size
+
+                self._fused_allreduce_active = (
+                    get_tensor_model_parallel_world_size() > 1
+                )
+            if self._fused_allreduce_active:
+                from vllm.distributed.communication_op import (
+                    tensor_model_parallel_fused_allreduce_rmsnorm,
+                )
+
+                return tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x.contiguous(),
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                )
 
         add_residual = residual is not None
         if add_residual:

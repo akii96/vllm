@@ -136,6 +136,30 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
+def fused_allreduce_rmsnorm(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_out_place(tensor, residual, weight, eps)
+
+
+def fused_allreduce_rmsnorm_fake(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(tensor), torch.empty_like(residual)
+
+
 def reduce_scatter(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
@@ -260,6 +284,12 @@ direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="fused_allreduce_rmsnorm",
+    op_func=fused_allreduce_rmsnorm,
+    fake_impl=fused_allreduce_rmsnorm_fake,
 )
 
 direct_register_custom_op(
@@ -510,10 +540,45 @@ class GroupCoordinator:
         else:
             return self._all_reduce_out_place(input_)
 
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.world_size == 1:
+            from vllm.model_executor.layers.layernorm import fused_add_rms_norm
+
+            return fused_add_rms_norm(input_, residual, weight, eps)
+
+        if self.use_custom_op_call:
+            return torch.ops.vllm.fused_allreduce_rmsnorm(
+                input_,
+                residual,
+                weight,
+                eps,
+                group_name=self.unique_name,
+            )
+        return self._fused_allreduce_rmsnorm_out_place(input_, residual, weight, eps)
+
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
+
+    def _fused_allreduce_rmsnorm_out_place(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm(
+            input_, residual, weight, eps
+        )
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size

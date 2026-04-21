@@ -179,6 +179,24 @@ class DeviceCommunicatorBase:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused TP all-reduce + residual-add + RMSNorm.
+
+        Not implemented on the base class: subclasses opt in to the fused path
+        when their platform has a kernel for it. Callers should only invoke
+        this when the model layer has been built with ``fused_allreduce=True``,
+        which itself is gated on platform-specific flags.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement fused_allreduce_rmsnorm"
+        )
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
             # Convert negative dim to positive.

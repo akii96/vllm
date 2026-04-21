@@ -1032,6 +1032,7 @@ class rocm_aiter_ops:
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
     # TODO: Consolidate under _LINEAR_ENABLED
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+    _FUSED_ALLREDUCE_RMSNORM_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSED_AR_RMSNORM
 
     @classmethod
     def refresh_env_variables(cls):
@@ -1056,6 +1057,7 @@ class rocm_aiter_ops:
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+        cls._FUSED_ALLREDUCE_RMSNORM_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSED_AR_RMSNORM
 
     @staticmethod
     def get_aiter_activation_type(activation_str: str):
@@ -1140,6 +1142,11 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_rmsnorm_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._RMSNORM_ENABLED
+
+    @classmethod
+    @if_aiter_supported
+    def is_fused_allreduce_rmsnorm_enabled(cls) -> bool:
+        return cls.is_rmsnorm_enabled() and cls._FUSED_ALLREDUCE_RMSNORM_ENABLED
 
     @classmethod
     @if_aiter_supported

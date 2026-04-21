@@ -6,6 +6,7 @@ import torch
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.device_communicators.all_reduce_utils import (
     should_nccl_symm_mem_allreduce,
 )
@@ -96,15 +97,40 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
+        # Aiter fused AR+RMSNorm kernel only has templates for world_size in
+        # {2, 4, 8} (anything else hits ``throw`` at launch).
+        self.use_rocm_aiter_fused_ar_rmsnorm = (
+            current_platform.is_rocm()
+            and rocm_aiter_ops.is_fused_allreduce_rmsnorm_enabled()
+            and self.world_size in (2, 4, 8)
+        )
+
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
-            self.ca_comm = CustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-                symm_mem_enabled=(
-                    self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
-                ),
-            )
+            if self.use_rocm_aiter_fused_ar_rmsnorm:
+                # Fused AR+RMSNorm needs the IPC handle (``_ptr``) managed by
+                # aiter's allocator, so swap in aiter's CustomAllreduce. Cap
+                # the IPC pool at 64 MiB (= the fused kernel's input bound)
+                # to avoid aiter's 1 GiB default reserving ~3 GiB/rank.
+                from aiter.dist.device_communicators.custom_all_reduce import (
+                    CustomAllreduce as AiterCustomAllreduce,
+                )
+
+                ca_max_size_mb = envs.VLLM_ROCM_AITER_CA_MAX_SIZE_MB or 64
+                self.ca_comm = AiterCustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                    max_size=ca_max_size_mb * 1024 * 1024,
+                )
+            else:
+                self.ca_comm = CustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                    symm_mem_enabled=(
+                        self.symm_mem_comm is not None
+                        and not self.symm_mem_comm.disabled
+                    ),
+                )
 
             if current_platform.is_rocm():
                 # Initialize a custom quick all-reduce implementation for AMD.
@@ -235,6 +261,87 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused tensor-parallel all-reduce + residual-add + RMSNorm.
+
+        ROCm-only fast path (mirrors aiter's own dispatch in
+        ``communicator_cuda.fused_allreduce_rmsnorm``):
+
+        1. **Aiter fused kernel.** When the input fits aiter's envelope, call
+           ``aiter::allreduce_fusion_kernel_*stage`` via
+           ``ca_comm.custom_fused_ar_rms`` (``ca_comm`` is aiter's own
+           ``CustomAllreduce`` so the IPC handles are registered correctly
+           during CUDA-graph capture).
+        2. **Split fallback.** Plain all-reduce followed by aiter's
+           out-of-place ``rmsnorm2d_fwd_with_add``. Both kernels return
+           fresh tensors, so the registered custom op stays out-of-place
+           with no extra memcpy.
+
+        Callers must only reach this method on the ROCm+aiter path; the
+        model-layer wiring gates ``fused_allreduce=True`` on the same
+        prerequisites that set ``use_rocm_aiter_fused_ar_rmsnorm`` here, so
+        hitting the guard below indicates a misconfigured layer.
+        """
+        if not self.use_rocm_aiter_fused_ar_rmsnorm:
+            raise RuntimeError(
+                "fused_allreduce_rmsnorm requires ROCm with "
+                "VLLM_ROCM_USE_AITER_FUSED_AR_RMSNORM=1 and TP world_size "
+                f"in (2, 4, 8); got world_size={self.world_size}."
+            )
+
+        ca_comm = self.ca_comm
+        # Mirrors aiter's `can_use_fuse_ar_rms` in
+        # aiter/dist/device_communicators/communicator_cuda.py.
+        n = input_.shape[-1]
+        total_bytes = input_.numel() * input_.element_size()
+        can_use_fuse_ar_rms = (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and hasattr(ca_comm, "custom_fused_ar_rms")
+            and ca_comm.should_custom_ar(input_)
+            and n <= 16384
+            and total_bytes < 8 * 1024 * 8192
+        )
+        if can_use_fuse_ar_rms:
+            one_stage_bytes = (
+                envs.VLLM_ROCM_AITER_FUSED_AR_RMSNORM_1STAGE_KB or 128
+            ) * 1024
+            use_1stage = total_bytes <= one_stage_bytes
+            # The 1-stage aiter kernel has a hard token-count cap of
+            # ``kMaxBlocks=80`` (see
+            # aiter/csrc/include/custom_all_reduce.cuh). When the threshold
+            # env var is bumped above that limit (e.g. for decode-batch
+            # sweeps), fall back to 2-stage instead of letting the kernel
+            # throw at launch and tear down CUDA-graph capture.
+            if use_1stage and (input_.numel() // n) > 80:
+                use_1stage = False
+            # Match aiter's own dispatch which asserts non-None; if the
+            # fused kernel ever silently fails we want to surface it rather
+            # than tear down half-registered graph buffers.
+            out = ca_comm.custom_fused_ar_rms(  # type: ignore[union-attr]
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage,
+            )
+            assert out is not None
+            return out
+
+        # Split-kernel fallback: aiter's `rms_norm2d_with_add` is out-of-place
+        # (allocates a new output and a new residual), so no clones are
+        # needed. `self.all_reduce` also returns a fresh tensor.
+        allreduce_out = self.all_reduce(input_)
+        return rocm_aiter_ops.rms_norm2d_with_add(
+            allreduce_out, residual_inp_, weight_, eps
+        )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size

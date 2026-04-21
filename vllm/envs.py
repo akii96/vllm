@@ -103,6 +103,14 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
+    # Fuse TP custom all-reduce with add+RMSNorm on ROCm (vLLM TP + aiter CA).
+    VLLM_ROCM_USE_AITER_FUSED_AR_RMSNORM: bool = False
+    # Max IPC buffer (MiB) for aiter's CustomAllreduce on the fused path.
+    # Default 64 MiB; aiter's own default (1 GiB) reserves ~3 GiB/rank.
+    VLLM_ROCM_AITER_CA_MAX_SIZE_MB: int | None = None
+    # 1-stage vs 2-stage crossover (KiB) for aiter's fused AR+RMSNorm.
+    # Default 128 KiB, matching aiter.
+    VLLM_ROCM_AITER_FUSED_AR_RMSNORM_1STAGE_KB: int | None = None
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
@@ -932,6 +940,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_RMSNORM", "True").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_USE_AITER_FUSED_AR_RMSNORM": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FUSED_AR_RMSNORM", "False").lower()
+        in ("true", "1")
+    ),
+    "VLLM_ROCM_AITER_CA_MAX_SIZE_MB": lambda: maybe_convert_int(
+        os.environ.get("VLLM_ROCM_AITER_CA_MAX_SIZE_MB", None)
+    ),
+    "VLLM_ROCM_AITER_FUSED_AR_RMSNORM_1STAGE_KB": lambda: maybe_convert_int(
+        os.environ.get("VLLM_ROCM_AITER_FUSED_AR_RMSNORM_1STAGE_KB", None)
     ),
     # Whether to use aiter mla ops.
     # By default is enabled.
