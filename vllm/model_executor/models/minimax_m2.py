@@ -30,6 +30,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -76,9 +77,11 @@ class MiniMaxM2MoE(nn.Module):
         config: PretrainedConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.reduce_results = reduce_results
 
         if self.tp_size > config.num_local_experts:
             raise ValueError(
@@ -134,7 +137,7 @@ class MiniMaxM2MoE(nn.Module):
             hidden_states=hidden_states, router_logits=router_logits
         )
         final_hidden_states = final_hidden_states
-        if self.tp_size > 1:
+        if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -156,6 +159,7 @@ class MiniMaxM2Attention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -194,6 +198,7 @@ class MiniMaxM2Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -262,6 +267,23 @@ class MiniMaxM2DecoderLayer(nn.Module):
         layer_idx = int(prefix.split(sep=".")[-1])
 
         self.layer_idx = layer_idx
+
+        # Defer the TP all-reduce after o_proj / MoE and fold it into the
+        # next RMSNorm via `RMSNorm(fused_allreduce=True)`. The ROCm+aiter
+        # `CudaCommunicator.fused_allreduce_rmsnorm` raises if invoked
+        # without the right prerequisites, so this gate must match exactly:
+        # aiter's fused AR+RMSNorm enabled (implies ROCm) and the kernel
+        # only ships templates for TP world_size in {2, 4, 8}.
+        self.fuse_ar_rmsnorm = (
+            rocm_aiter_ops.is_fused_allreduce_rmsnorm_enabled()
+            and get_tensor_model_parallel_world_size() in (2, 4, 8)
+        )
+
+        # When fusion is active the upstream o_proj / MoE must skip their
+        # own all-reduce so the fused RMSNorm can perform it.
+        attn_reduce_results = not self.fuse_ar_rmsnorm
+        moe_reduce_results = not self.fuse_ar_rmsnorm
+
         self.self_attn = MiniMaxM2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -275,16 +297,29 @@ class MiniMaxM2DecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
+            reduce_results=attn_reduce_results,
         )
 
         self.block_sparse_moe = MiniMaxM2MoE(
             config=config,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            reduce_results=moe_reduce_results,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Layer 0's `input_layernorm` runs on the embedding output and gets
+        # `residual=None` on its first call, so there is nothing to fuse the
+        # all-reduce *into* there. (PP intermediate ranks always receive a
+        # non-None residual via `IntermediateTensors`, so absolute layer_idx
+        # is the right gate even when `start_layer != 0`.)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=self.fuse_ar_rmsnorm and layer_idx > 0,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=self.fuse_ar_rmsnorm,
         )
 
     def forward(
@@ -349,8 +384,23 @@ class MiniMaxM2Model(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
+        # The final norm has to fold the all-reduce in iff the last decoder
+        # layer's MoE was built with `reduce_results=False`, i.e. it set
+        # `fuse_ar_rmsnorm=True`.
+        fused_allreduce_final_norm = (
+            get_pp_group().is_last_rank
+            and self.end_layer > self.start_layer
+            and getattr(
+                self.layers[self.end_layer - 1], "fuse_ar_rmsnorm", False
+            )
+        )
+
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                fused_allreduce=fused_allreduce_final_norm,
+            )
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
