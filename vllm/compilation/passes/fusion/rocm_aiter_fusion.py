@@ -86,7 +86,7 @@ class AiterRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
             input: torch.Tensor,
             weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            result_rms = torch.ops.vllm_ir.rms_norm(input, weight, self.epsilon)
+            result_rms = torch.ops.vllm_ir.rms_norm(input, weight, self.epsilon, None)
             result, scale = self.quant_matcher(result_rms)
             return result, scale
 
@@ -141,7 +141,7 @@ class AiterFusedAddRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
             residual: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             result_rms, residual_out = torch.ops.vllm_ir.fused_add_rms_norm(
-                input, residual, weight, self.epsilon
+                input, residual, weight, self.epsilon, None
             )
             result, scale = self.quant_matcher(result_rms)
 
@@ -204,7 +204,7 @@ class AiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             input: torch.Tensor,
             weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            result_rms = torch.ops.vllm_ir.rms_norm(input, weight, self.epsilon)
+            result_rms = torch.ops.vllm_ir.rms_norm(input, weight, self.epsilon, None)
             result, scale = self.quant_matcher(result_rms)
             return result, scale
 
@@ -262,7 +262,7 @@ class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             residual: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             result_rms, residual_out = torch.ops.vllm_ir.fused_add_rms_norm(
-                input, residual, weight, self.epsilon
+                input, residual, weight, self.epsilon, None
             )
             result, scale = self.quant_matcher(result_rms)
 
@@ -463,7 +463,7 @@ class AddAiterRMSNormPadPattern:
                 self.hidden_size % self.x_pad_to_multiple
             )
             result_rms, residual_out = torch.ops.vllm_ir.fused_add_rms_norm(
-                input, residual, weight, self.epsilon
+                input, residual, weight, self.epsilon, None
             )
             router_logits = torch.ops.vllm.rocm_unquantized_gemm(
                 result_rms, router_weight, router_bias
@@ -579,8 +579,8 @@ class MLADualRMSNormPattern(
             k_pe_dim = kv_dim - kv_c_dim
             q_c, kv_lora = projected.split([q_dim, kv_dim], dim=-1)
             kv_c, k_pe = kv_lora.split([kv_c_dim, k_pe_dim], dim=-1)
-            q_normed = vllm.ir.ops.rms_norm(q_c, q_weight, eps)
-            kv_normed = vllm.ir.ops.rms_norm(kv_c, kv_weight, eps)
+            q_normed = vllm.ir.ops.rms_norm(q_c, q_weight, eps, None)
+            kv_normed = vllm.ir.ops.rms_norm(kv_c, kv_weight, eps, None)
             return q_normed, kv_normed, k_pe
 
         return _pattern
