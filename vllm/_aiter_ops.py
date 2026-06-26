@@ -1501,6 +1501,7 @@ class rocm_aiter_ops:
     # Lazily probed: whether aiter.topk_softmax supports the
     # num_shared_experts / shared_expert_scoring_func args (7-arg form).
     _TOPK_SOFTMAX_FUSED_SIGMOID: bool | None = None
+    _HAS_CUSTOM_FUSED_QKNORM_AR: bool | None = None
 
     @classmethod
     def refresh_env_variables(cls):
@@ -1745,6 +1746,27 @@ class rocm_aiter_ops:
         return (
             aiter_ar_comm if isinstance(aiter_ar_comm, AiterCustomAllreduce) else None
         )
+
+    @classmethod
+    @if_aiter_supported
+    def has_custom_fused_qknorm_ar(cls) -> bool:
+        """Whether the installed aiter build exposes custom_fused_qknorm_ar.
+
+        TODO(akii96): remove once vLLM's minimum AITER is >= v0.1.14, which
+        ships custom_fused_qknorm_ar (https://github.com/ROCm/aiter/pull/3163).
+        """
+        if cls._HAS_CUSTOM_FUSED_QKNORM_AR is None:
+            try:
+                from aiter.dist.device_communicators.custom_all_reduce import (
+                    CustomAllreduce,
+                )
+
+                cls._HAS_CUSTOM_FUSED_QKNORM_AR = hasattr(
+                    CustomAllreduce, "custom_fused_qknorm_ar"
+                )
+            except ImportError:
+                cls._HAS_CUSTOM_FUSED_QKNORM_AR = False
+        return cls._HAS_CUSTOM_FUSED_QKNORM_AR
 
     @classmethod
     @if_aiter_supported
