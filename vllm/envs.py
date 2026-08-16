@@ -147,6 +147,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
+    VLLM_ROCM_USE_FLYDSL_ATTENTION: bool = False
+    VLLM_FLYDSL_KERNELS_PATH: str | None = None
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -1333,6 +1335,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "False").lower()
         in ("true", "1")
     ),
+    # Make the FlyDSL attention backend (ROCM_FLYDSL_ATTN) eligible for
+    # automatic selection. An explicit `--attention-backend=ROCM_FLYDSL_ATTN`
+    # works without it; the flag only affects the default preference order.
+    # Either way the backend runs the FlyDSL kernel for causal prefill-shaped
+    # batches only and serves the rest, decode included, with the AITER kernel
+    # it inherits.
+    "VLLM_ROCM_USE_FLYDSL_ATTENTION": lambda: (
+        os.getenv("VLLM_ROCM_USE_FLYDSL_ATTENTION", "False").lower() in ("true", "1")
+    ),
+    # Root of a FlyDSL source checkout (the directory holding kernels/attention/).
+    # Needed because the flydsl wheel ships the DSL compiler and runtime only,
+    # not the attention kernels.
+    "VLLM_FLYDSL_KERNELS_PATH": lambda: os.getenv("VLLM_FLYDSL_KERNELS_PATH", None),
     # Whether to use aiter fusion shared experts ops.
     # By default is disabled.
     "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": lambda: (
