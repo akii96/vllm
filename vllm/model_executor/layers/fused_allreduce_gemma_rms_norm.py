@@ -8,10 +8,16 @@ into a ``GemmaRMSNorm`` that adds the residual and normalizes. flashinfer ships 
 kernel that fuses all-reduce + residual-add + RMSNorm into a single launch; this
 helper drives it directly (no torch.compile pass) for models that run eager.
 
-Scope: attention output only, no quantization. When the flashinfer fast path is
-not applicable (TP==1, flashinfer/NVSwitch unavailable, unsupported dtype, or an
-oversize batch) it falls back to ``all_reduce`` + ``GemmaRMSNorm``, which is
-numerically identical to the unfused model path.
+On ROCm flashinfer is unavailable, so the same fusion is driven through AITER's
+``fused_allreduce_rmsnorm`` kernel, whose ``gemma_norm`` flag applies the Gemma
+``(1 + weight)`` scale. Without it the decode path runs
+``aiter::cross_device_reduce_2stage`` immediately followed by a separate
+``_gemma_fused_add_rmsnorm`` launch.
+
+Scope: attention output only, no quantization. When neither fast path is
+applicable (TP==1, no flashinfer/NVSwitch, no AITER custom all-reduce,
+unsupported dtype, or an oversize batch) it falls back to ``all_reduce`` +
+``GemmaRMSNorm``, which is numerically identical to the unfused model path.
 """
 
 import torch
@@ -100,6 +106,49 @@ def _can_use_flashinfer(hidden_states: torch.Tensor, tp_size: int) -> tuple[bool
     return True, max_token_num
 
 
+def _can_use_aiter(hidden_states: torch.Tensor, weight: torch.Tensor):
+    """Return the AITER custom all-reduce to fuse through, or None.
+
+    Every gate here mirrors one the AITER kernel enforces internally; the check
+    has to happen in the caller because ``custom_fused_ar_rms`` returns None on
+    an ineligible input and the registered op is not allowed to.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return None
+    if (
+        hidden_states.dim() != 2
+        or not hidden_states.is_contiguous()
+        or hidden_states.dtype not in _FI_SUPPORTED_DTYPES
+        or weight.numel() != hidden_states.shape[-1]
+    ):
+        return None
+
+    from vllm._aiter_ops import (
+        fused_allreduce_rmsnorm_is_profitable,
+        rocm_aiter_ops,
+    )
+
+    aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
+    if aiter_ar is None or aiter_ar.disabled:
+        return None
+    # Pre-0.1.12 AITER specialized the launcher on HIDDEN_DIM and silently
+    # no-op'd outside {512, 1024, 2048, 4096}; M3's 6144 is not in that set.
+    if not aiter_ar.supports_dynamic_hidden_dim:
+        return None
+    if not aiter_ar.should_custom_ar(hidden_states):
+        return None
+    # Only fuse where fusing is measured to beat the unfused fallback at this
+    # rank count. Both fused kernels lose to a plain two-stage all-reduce plus a
+    # separate norm above a payload that depends on the world size, and an
+    # unmeasured world size declines rather than guessing; falling back leaves
+    # the caller at parity instead of regressing.
+    if not fused_allreduce_rmsnorm_is_profitable(hidden_states):
+        return None
+    return aiter_ar
+
+
 def fused_allreduce_gemma_rms_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -137,6 +186,19 @@ def fused_allreduce_gemma_rms_norm(
             norm_out=norm_out,
         )
         return norm_out, hidden_states
+
+    if _can_use_aiter(hidden_states, norm.weight) is not None:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        # Returns (normed, all_reduce(hidden_states) + residual); `residual` is
+        # read-only, so this is safe under CUDA-graph capture.
+        return rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()(
+            input_=hidden_states,
+            residual=residual,
+            weight=norm.weight.to(hidden_states.dtype),
+            epsilon=norm.variance_epsilon,
+            gemma_norm=True,
+        )
 
     # Fallback: explicit all-reduce + GemmaRMSNorm (matches the unfused model).
     reduced = tensor_model_parallel_all_reduce(hidden_states)

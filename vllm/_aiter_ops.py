@@ -885,17 +885,61 @@ def _rocm_aiter_rmsnorm_fused_dynamic_quant_fake(
     return out, y_scale
 
 
-def _rocm_aiter_fused_allreduce_rmsnorm_impl(
-    input_: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
-    assert aiter_ar is not None, "aiter allreduce must be initialized"
-    ca = aiter_ar.aiter_ca
+# One-shot vs two-stage selection for the fused all-reduce + RMSNorm kernels.
+#
+# This is NOT the same threshold as the plain all-reduce's, which lives in aiter
+# (`csrc/include/custom_all_reduce.cuh`). The two kernel families have different
+# algorithm preferences at the same message size, so the constants genuinely
+# differ rather than one of them being stale: measured on gfx950 (MI355X,
+# ROCm 7.2.3) at four ranks under CUDA-graph replay, the fused one-shot kernel
+# beats the fused two-stage one up to 240 KB and loses from 264 KB, while for
+# the plain kernels two-stage wins at every size.
+#
+# 256 KB sits inside that measured 240-264 KB bracket, so it is the crossover
+# rather than a round number near it.
+_FUSED_AR_RMS_1STAGE_MAX_BYTES = {4: 256 * 1024, 8: 128 * 1024}
 
-    total_bytes = input_.numel() * input_.element_size()
+# The quant variants call a different kernel (`fused_ar_rms_per_group_quant`)
+# which was not part of that sweep, so they keep the original constant until
+# someone measures them.
+_FUSED_AR_RMS_QUANT_1STAGE_MAX_BYTES = {4: 256 * 1024, 8: 128 * 1024}
+
+# Whether fusing at all pays. This is a different question from which algorithm
+# the fused kernel should use, and conflating the two is what made the fusion
+# look safe at four ranks when it is not: picking the better of two fused
+# kernels says nothing about whether either beats not fusing.
+#
+# The fused kernel has only a one-shot path worth taking, and one-shot reads the
+# whole message from every peer -- world_size times the message per rank against
+# two-stage's twice -- while the fusion's saving is one norm launch and one round
+# trip through the hidden state, near-constant in the message size. So above some
+# payload the unfused pair (plain two-stage all-reduce, then a separate norm) is
+# simply cheaper, and there a caller should decline and stay at parity.
+#
+# Entries are measured crossovers per world size. A world size that is absent has
+# not been measured and declines, rather than inheriting a bound measured at a
+# different rank count.
+#
+#   2 ranks: fused one-shot wins at every size the kernel admits, to the
+#            80-token window bound (1.026x-1.080x over m = 16..80).
+#   4 ranks: crossover measured between 156 KB (1.003x) and 168 KB (0.984x);
+#            160 KB is inside that bracket. Past it the loss grows monotonically
+#            to 0.675x at 960 KB, so the bound is load-bearing rather than a cut
+#            through a flat region.
+#
+# Both were measured against a plain *two-stage* all-reduce plus a separate norm,
+# which is what aiter dispatches at these sizes. If the plain collective is ever
+# put back on its one-shot kernel below 160 KB, the unfused arm gets slower and
+# this window widens.
+_FUSED_AR_RMS_FUSION_MAX_BYTES = {2: 1024 * 1024, 4: 160 * 1024}
+
+
+def _fused_ar_rms_use_1stage(
+    input_: torch.Tensor,
+    ca,
+    one_stage_max_bytes: dict[int, int],
+) -> bool:
+    """Whether the fused AR+RMSNorm launcher should take its one-shot path."""
     hidden_dim = input_.shape[-1]
     token_num = input_.numel() // hidden_dim
     if input_.dtype in (torch.bfloat16, torch.float16):
@@ -904,19 +948,58 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     else:
         hidden_ok = False
     token_ok = token_num <= 80
-    world_size = ca.world_size
-    full_nvlink = ca.fully_connected
 
+    total_bytes = input_.numel() * input_.element_size()
+    world_size = ca.world_size
     if world_size == 2:
+        # Two ranks move the same bytes either way, and one-shot's single
+        # barrier wins at every size custom AR accepts.
         size_ok = True
-    elif full_nvlink and world_size <= 4:
-        size_ok = total_bytes < 256 * 1024
-    elif full_nvlink and world_size <= 8:
-        size_ok = total_bytes < 128 * 1024
+    elif ca.fully_connected and world_size <= 4:
+        size_ok = total_bytes < one_stage_max_bytes[4]
+    elif ca.fully_connected and world_size <= 8:
+        size_ok = total_bytes < one_stage_max_bytes[8]
     else:
         size_ok = False
 
-    use_1stage = hidden_ok and token_ok and size_ok
+    return hidden_ok and token_ok and size_ok
+
+
+def fused_allreduce_rmsnorm_is_profitable(input_: torch.Tensor) -> bool:
+    """Whether fusing beats an unfused all-reduce plus a separate norm.
+
+    Callers that have a working unfused path use this to decline the fusion and
+    stay at parity instead of regressing. Pure host arithmetic on shape, dtype
+    and world size: no device synchronisation, and nothing that can differ
+    between CUDA-graph capture and replay.
+    """
+    aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
+    if aiter_ar is None or aiter_ar.disabled:
+        return False
+    ca = aiter_ar.aiter_ca
+    # The fused two-stage kernel loses to an unfused all-reduce plus a separate
+    # norm at every size and rank count measured (0.90x-0.93x at four ranks), so
+    # profitability requires the fused one-shot path specifically.
+    if not _fused_ar_rms_use_1stage(input_, ca, _FUSED_AR_RMS_1STAGE_MAX_BYTES):
+        return False
+    max_bytes = _FUSED_AR_RMS_FUSION_MAX_BYTES.get(ca.world_size)
+    if max_bytes is None:
+        return False
+    return input_.numel() * input_.element_size() < max_bytes
+
+
+def _rocm_aiter_fused_allreduce_rmsnorm_impl(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
+    assert aiter_ar is not None, "aiter allreduce must be initialized"
+    ca = aiter_ar.aiter_ca
+
+    use_1stage = _fused_ar_rms_use_1stage(input_, ca, _FUSED_AR_RMS_1STAGE_MAX_BYTES)
 
     result = ca.custom_fused_ar_rms(
         input_,
@@ -924,6 +1007,7 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
         weight,
         epsilon,
         use_1stage=use_1stage,
+        gemma_norm=gemma_norm,
     )
     assert result is not None
     return result[0], result[1]
@@ -934,6 +1018,7 @@ def _rocm_aiter_fused_allreduce_rmsnorm_fake(
     residual: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(input_), torch.empty_like(residual)
 
@@ -955,28 +1040,9 @@ def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl(
     assert aiter_ar is not None, "aiter allreduce must be initialized"
     ca = aiter_ar.aiter_ca
 
-    total_bytes = input_.numel() * input_.element_size()
-    hidden_dim = input_.shape[-1]
-    token_num = input_.numel() // hidden_dim
-    if input_.dtype in (torch.bfloat16, torch.float16):
-        pack_size = 16 // input_.element_size()
-        hidden_ok = hidden_dim % pack_size == 0 and hidden_dim // pack_size <= 1024
-    else:
-        hidden_ok = False
-    token_ok = token_num <= 80
-    world_size = ca.world_size
-    full_nvlink = ca.fully_connected
-
-    if world_size == 2:
-        size_ok = True
-    elif full_nvlink and world_size <= 4:
-        size_ok = total_bytes < 256 * 1024
-    elif full_nvlink and world_size <= 8:
-        size_ok = total_bytes < 128 * 1024
-    else:
-        size_ok = False
-
-    use_1stage = hidden_ok and token_ok and size_ok
+    use_1stage = _fused_ar_rms_use_1stage(
+        input_, ca, _FUSED_AR_RMS_QUANT_1STAGE_MAX_BYTES
+    )
 
     result = ca.fused_ar_rms_per_group_quant(
         input_,
@@ -1028,28 +1094,9 @@ def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_impl(
     assert aiter_ar is not None, "aiter allreduce must be initialized"
     ca = aiter_ar.aiter_ca
 
-    total_bytes = input_.numel() * input_.element_size()
-    hidden_dim = input_.shape[-1]
-    token_num = input_.shape[0]
-    if input_.dtype in (torch.bfloat16, torch.float16):
-        pack_size = 16 // input_.element_size()
-        hidden_ok = hidden_dim % pack_size == 0 and hidden_dim // pack_size <= 1024
-    else:
-        hidden_ok = False
-    token_ok = token_num <= 80
-    world_size = ca.world_size
-    full_nvlink = ca.fully_connected
-
-    if world_size == 2:
-        size_ok = True
-    elif full_nvlink and world_size <= 4:
-        size_ok = total_bytes < 256 * 1024
-    elif full_nvlink and world_size <= 8:
-        size_ok = total_bytes < 128 * 1024
-    else:
-        size_ok = False
-
-    use_1stage = hidden_ok and token_ok and size_ok
+    use_1stage = _fused_ar_rms_use_1stage(
+        input_, ca, _FUSED_AR_RMS_QUANT_1STAGE_MAX_BYTES
+    )
 
     result = ca.fused_ar_rms_per_group_quant(
         input_,
