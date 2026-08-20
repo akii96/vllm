@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVQuantMode,
     MambaSpec,
+    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -482,6 +483,7 @@ def _align_mixed_attention_kv_cache_views(
     logical views so block IDs address the same bytes.
     """
     block_dims_by_layer: dict[str, int] = {}
+    key_only_layers: set[str] = set()
     for group in attn_groups:
         kv_cache_spec = group.kv_cache_spec
         if not isinstance(kv_cache_spec, AttentionSpec):
@@ -497,6 +499,8 @@ def _align_mixed_attention_kv_cache_views(
         for layer_name in group.layer_names:
             if layer_name in kv_caches:
                 block_dims_by_layer[layer_name] = block_dim
+                if isinstance(kv_cache_spec, MLAAttentionSpec):
+                    key_only_layers.add(layer_name)
 
     for kv_tensor in kv_cache_config.kv_cache_tensors:
         if kv_tensor.block_stride > 0:
@@ -515,17 +519,27 @@ def _align_mixed_attention_kv_cache_views(
             continue
 
         for layer_name in kv_tensor.shared_by:
-            if block_dims_by_layer.get(layer_name) == 0:
-                _restride_blocks_first_kv_cache_to_kv_first_storage(
-                    kv_caches[layer_name]
-                )
+            if block_dims_by_layer.get(layer_name) != 0:
+                continue
+            if layer_name in key_only_layers:
+                # A key-only side cache has no K/V dimension to swap. Its
+                # blocks-first view already addresses its own allocation.
+                continue
+            _restride_blocks_first_kv_cache_to_kv_first_storage(
+                kv_caches[layer_name], layer_name
+            )
 
 
 def _restride_blocks_first_kv_cache_to_kv_first_storage(
     kv_cache: torch.Tensor,
+    layer_name: str = "",
 ) -> None:
     assert kv_cache.ndim >= 3
-    assert kv_cache.shape[1] == 2
+    if kv_cache.shape[1] != 2:
+        raise ValueError(
+            f"Cannot align blocks-first KV cache {layer_name!r} with shape "
+            f"{tuple(kv_cache.shape)}: the view has no K/V dimension in dim 1."
+        )
     page_size = kv_cache.shape[2:].numel()
     num_blocks = kv_cache.shape[0]
     expected_tail_stride = torch.empty(kv_cache.shape[2:]).stride()
