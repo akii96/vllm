@@ -428,7 +428,6 @@ def _run_gluon_decode(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
 ) -> None:
-    from aiter import dtypes as aiter_dtypes
     from aiter.ops.triton.gluon.pa_decode_gluon import (
         get_recommended_splits,
         pa_decode_gluon,
@@ -461,8 +460,16 @@ def _run_gluon_decode(
     )
 
     is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
-    compute_type = aiter_dtypes.fp8 if is_fp8 else q.dtype
+    # ``compute_type`` controls the MFMA operand type, not the KV storage
+    # format. The kernel already unpacks and descales FP8 K/V below. Selecting
+    # FP8 here additionally narrows the BF16 query without a query scale, which
+    # needlessly loses accuracy. Keep query compute in its original dtype.
+    compute_type = q.dtype
     if is_fp8:
+        if k_scale is None or v_scale is None:
+            raise ValueError(
+                "MiniMax-M3 AITER sparse PA requires K/V scales for FP8 KV cache"
+            )
         k_scale_arg = _gluon_scale_arg(
             k_scale, num_phys_pages=nphys16, num_kv_heads=hkv
         )
