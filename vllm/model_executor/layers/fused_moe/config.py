@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Union
@@ -1206,12 +1207,27 @@ class FusedMoEParallelConfig:
             and vllm_parallel_config.enable_expert_parallel
         )
 
-        dp_size = dp_size_
-        dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
+        # Native data-parallel serving normally flattens DP into the MoE TP
+        # group when expert parallelism is disabled.  The gfx942 FlyDSL W8A8
+        # path is a complete TP kernel (including top-k reduction), so applying
+        # the DP AllGather+ReduceScatter wrapper around it both changes its TP
+        # shard from TP4 to TP8 and corrupts the result.  Keep each DP engine as
+        # a genuine TP replica for this backend: weights remain TP4-sharded and
+        # requests never cross replica boundaries inside an MoE layer.
+        flydsl_dp_replicas = (
+            not use_ep
+            and dp_size_ > 1
+            and current_platform.is_rocm()
+            and os.environ.get("VLLM_ROCM_USE_FLYDSL_MOE", "0") == "1"
+        )
+        dp_size = 1 if flydsl_dp_replicas else dp_size_
+        dp_rank = 0 if flydsl_dp_replicas else (
+            get_dp_group().rank_in_group if dp_size > 1 else 0
+        )
         pcp_size = pcp_size_
         pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
         tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(
-            tp_size_, dp_size_, dp_rank, pcp_size_, pcp_rank
+            tp_size_, dp_size, dp_rank, pcp_size_, pcp_rank
         )
 
         if not use_ep:
