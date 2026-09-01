@@ -116,16 +116,16 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         backend_cls: type[AttentionBackend] = MiniMaxM3IndexerBackend,
     ) -> None:
         super().__init__()
-        if indexer_kv_dtype in ("fp8", "fp8_e4m3"):
-            # e4m3fn specifically: the fused writer checks for Float8_e4m3fn and
-            # saturates at its 448, so an fnuz cache would disagree on range.
-            cache_dtype = torch.float8_e4m3fn
+        if indexer_kv_dtype == "fp8":
+            # e4m3fn on CUDA and gfx950, e4m3fnuz on gfx942. Both writers and
+            # the Triton scorer take the flavour from this tensor's dtype.
+            cache_dtype = current_platform.fp8_dtype()
         elif indexer_kv_dtype == "bf16":
             cache_dtype = torch.bfloat16
         else:
             raise NotImplementedError(
                 f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
-                "MiniMax M3 indexer cache (only 'bf16' or 'fp8'/'fp8_e4m3')."
+                "MiniMax M3 indexer cache (only 'bf16' or 'fp8')."
             )
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
@@ -482,11 +482,7 @@ def select_indexer_impl_cls(
     is_sm100 = (
         current_platform.is_cuda() and current_platform.is_device_capability_family(100)
     )
-    use_msa = (
-        is_sm100
-        and topk_blocks == 16
-        and indexer_kv_dtype in ("bf16", "fp8", "fp8_e4m3")
-    )
+    use_msa = is_sm100 and topk_blocks == 16 and indexer_kv_dtype in ("bf16", "fp8")
     if use_msa:
         # Lazy import so AMD / non-SM100 never import fmha_sm100.
         from vllm.models.minimax_m3.nvidia.indexer_msa import (

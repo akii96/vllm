@@ -29,6 +29,10 @@ from vllm.models.minimax_m3.amd.ops.index_topk import (
 
 HEAD_DIM = 128
 DEV = "cuda"
+# The e4m3 flavour the indexer cache actually uses here. Hard-coding e4m3fn
+# would exercise a software-emulated convert on gfx942 instead of the fnuz one
+# the serving path takes.
+FP8_CACHE_DTYPE = current_platform.fp8_dtype()
 
 
 def _build(q_lens, prefix_lens, num_idx_heads, cache_dtype, seed=0):
@@ -111,7 +115,7 @@ def _assert_valid_topk(actual, t, topk, local_blocks):
 
 @pytest.mark.parametrize("topk", [1, 6, 16, 64])
 @pytest.mark.parametrize("num_idx_heads", [1, 2])
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, FP8_CACHE_DTYPE])
 def test_prefill_topk_matches_reference(topk, num_idx_heads, cache_dtype):
     t = _build([300, 1, 133], [0, 1024, 4096], num_idx_heads, cache_dtype)
     score = minimax_m3_index_score(
@@ -326,7 +330,7 @@ def test_prefill_topk_rejects_unservable_topk():
         )
 
 
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, FP8_CACHE_DTYPE])
 @pytest.mark.parametrize("batch", [1, 8, 40])
 def test_decode_topk_matches_reference(cache_dtype, batch):
     topk, local_blocks = 16, 1
@@ -349,18 +353,24 @@ def test_decode_topk_matches_reference(cache_dtype, batch):
 
 
 def test_fp8_index_cache_insert_clamps_out_of_range():
-    """bf16 index keys above the e4m3 max must saturate, not become NaN/inf."""
-    from vllm.models.minimax_m3.amd.ops.sparse_pa import minimax_m3_insert_index_cache
+    """bf16 index keys above the e4m3 max must saturate, not become NaN/inf.
 
-    finfo = torch.finfo(torch.float8_e4m3fn)
-    fp8_min, fp8_max = finfo.min, finfo.max
+    The bound is the one the writer uses for this flavour (448 for e4m3fn, 224
+    for e4m3fnuz), so this also pins the two writers to the same range.
+    """
+    from vllm.models.minimax_m3.amd.ops.sparse_pa import (
+        _fp8_clamp_bounds,
+        minimax_m3_insert_index_cache,
+    )
+
+    fp8_min, fp8_max = _fp8_clamp_bounds(FP8_CACHE_DTYPE)
     index_k = torch.tensor(
         [[1e4] * HEAD_DIM, [-1e4] * HEAD_DIM, [1.5] * HEAD_DIM],
         device=DEV,
         dtype=torch.bfloat16,
     )
     cache = torch.zeros(
-        4, SPARSE_BLOCK_SIZE, HEAD_DIM, device=DEV, dtype=torch.float8_e4m3fn
+        4, SPARSE_BLOCK_SIZE, HEAD_DIM, device=DEV, dtype=FP8_CACHE_DTYPE
     )
     slots = torch.tensor([0, 1, 2], device=DEV, dtype=torch.int32)
     minimax_m3_insert_index_cache(index_k, cache, slots)

@@ -57,6 +57,7 @@
 #include "../cuda_compat.h"
 #include "type_convert.cuh"
 #include "../attention/dtype_fp8.cuh"
+#include "../quantization/utils.cuh"
 #include "dispatch_utils.h"
 
 #ifdef USE_ROCM
@@ -80,19 +81,6 @@
   #endif
 #endif
 
-#ifdef USE_ROCM
-// ROCm-compatible direct float -> E4M3 FP8 conversion (mirrors the DeepSeek V4
-// fused kernel).
-__device__ __forceinline__ uint8_t rocm_cvt_float_to_fp8_e4m3(float val) {
-  #if defined(HIP_FP8_TYPE_OCP)
-  __hip_fp8_e4m3 fp8_val(val);
-  #else
-  __hip_fp8_e4m3_fnuz fp8_val(val);
-  #endif
-  return reinterpret_cast<uint8_t&>(fp8_val);
-}
-#endif
-
 namespace vllm {
 namespace minimax_m3_fused_ops {
 
@@ -101,6 +89,16 @@ inline int getSMVersion() {
   auto* props = get_device_prop();
   return props->major * 10 + props->minor;
 }
+
+#ifdef USE_ROCM
+// gfx942 converts FNUZ natively, gfx950 OCP; the other flavour has no
+// instruction and the compiler lowers it to s_trap. The HIP_FP8_TYPE_* macros
+// only report which types the headers define, so they cannot be used for this.
+inline bool devicePrefersFnuzFp8() {
+  auto* props = get_device_prop();
+  return std::string(props->gcnArchName).find("gfx94") != std::string::npos;
+}
+#endif
 }  // namespace
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -243,13 +241,27 @@ __device__ __forceinline__ void storeCacheElems(
   }
 }
 
-// Store 4 fp32 registers -> 4 contiguous E4M3 FP8 bytes (direct cast,
-// saturating to ±448). Used for the fp8 indexer-Q / index-K outputs; no scale
-// (RMSNorm outputs are O(1) and the score path only needs relative block
-// ordering).
+using Fp8E4M3 = torch::headeronly::Float8_e4m3fn;
+using Fp8E4M3Fnuz = torch::headeronly::Float8_e4m3fnuz;
+
+// q_fp8_out's flavour is fixed by the target rather than by an argument, since
+// its dtype is not templated through the kernel. gfx942 has no OCP convert, so
+// emitting one here would put a trap in every instantiation.
+#if defined(USE_ROCM) && defined(__gfx942__)
+using QFp8Type = Fp8E4M3Fnuz;
+#else
+using QFp8Type = Fp8E4M3;
+#endif
+
+// Store 4 fp32 registers -> 4 contiguous E4M3 FP8 bytes. Used for the fp8
+// indexer-Q / index-K outputs; no scale (RMSNorm outputs are O(1) and the score
+// path only needs relative block ordering). `fp8_t` selects the E4M3 flavour,
+// which is a device property rather than a model one.
+template <typename fp8_t>
 __device__ __forceinline__ void storeElemsFp8(
-    uint8_t* __restrict__ dst, float const (&elems)[kElemsPerLane]) {
-  constexpr float kFp8Max = 448.0f;
+    fp8_t* __restrict__ dst, float const (&elems)[kElemsPerLane]) {
+  constexpr fp8_t kQMax{quant_type_max_v<fp8_t>};
+  float const kFp8Max = static_cast<float>(kQMax);
 #ifndef USE_ROCM
   __nv_fp8x2_storage_t out2[kElemsPerLane / 2];
   #pragma unroll
@@ -264,16 +276,16 @@ __device__ __forceinline__ void storeElemsFp8(
   #pragma unroll
   for (int i = 0; i < kElemsPerLane; i++) {
     float vv = fminf(fmaxf(elems[i], -kFp8Max), kFp8Max);
-    dst[i] = rocm_cvt_float_to_fp8_e4m3(vv);
+    dst[i] = fp8::cvt_c10<fp8_t>(vv);
   }
 #endif
 }
 
 // Match scaled_fp8_quant(q_out): materialize q in scalar_t before applying the
 // inverse dequantization scale and converting it to E4M3.
-template <typename scalar_t>
+template <typename scalar_t, typename fp8_t>
 __device__ __forceinline__ void storeScaledQElemsFp8(
-    uint8_t* __restrict__ dst, float const (&elems)[kElemsPerLane],
+    fp8_t* __restrict__ dst, float const (&elems)[kElemsPerLane],
     float const inv_scale) {
   using Converter = vllm::_typeConvert<scalar_t>;
   float scaled[kElemsPerLane];
@@ -282,7 +294,7 @@ __device__ __forceinline__ void storeScaledQElemsFp8(
     auto const rounded = Converter::convert(elems[i]);
     scaled[i] = static_cast<float>(rounded) * inv_scale;
   }
-  storeElemsFp8(dst, scaled);
+  storeElemsFp8<fp8_t>(dst, scaled);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -314,7 +326,7 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     scalar_t* __restrict__ qkv,  // [N, qkv_row] in/out (packs index if sparse)
     scalar_t* __restrict__ q_out,         // [N, nq*128] contiguous, or nullptr
     uint8_t* __restrict__ q_fp8_out,      // [N, nq*128] E4M3, or nullptr
-    out_idx_t* __restrict__ index_q_out,  // [N, niq*128]; scalar_t or e4m3 byte
+    out_idx_t* __restrict__ index_q_out,  // [N, niq*128]; scalar_t or e4m3
     scalar_t const* __restrict__ q_norm_w,
     scalar_t const* __restrict__ k_norm_w,
     scalar_t const* __restrict__ iq_norm_w,
@@ -453,10 +465,10 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
       if constexpr (kFp8Idx) {
         // index_q is e4m3 bytes; Q/K (and in-place index_k) stay scalar_t.
         if (isIQ && index_q_out != nullptr) {
-          storeElemsFp8(index_q_out +
-                            static_cast<int64_t>(tokenIdx) * niq * kHeadDim +
-                            (slot - iq_begin) * kHeadDim + dim_base,
-                        elems);
+          storeElemsFp8<out_idx_t>(
+              index_q_out + static_cast<int64_t>(tokenIdx) * niq * kHeadDim +
+                  (slot - iq_begin) * kHeadDim + dim_base,
+              elems);
         } else {
           storeElems<scalar_t>(store_ptr + dim_base, elems);
         }
@@ -464,9 +476,10 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
         storeElems<scalar_t>(store_ptr + dim_base, elems);
       }
       if (isQ && q_fp8_out != nullptr) {
-        storeScaledQElemsFp8<scalar_t>(
-            q_fp8_out + static_cast<int64_t>(tokenIdx) * nq * kHeadDim +
-                slot * kHeadDim + dim_base,
+        storeScaledQElemsFp8<scalar_t, QFp8Type>(
+            reinterpret_cast<QFp8Type*>(
+                q_fp8_out + static_cast<int64_t>(tokenIdx) * nq * kHeadDim +
+                slot * kHeadDim + dim_base),
             elems, q_fp8_inv_scale);
       }
     }
@@ -483,7 +496,8 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
       if (sm >= 0) {  // skip padded / unscheduled tokens
         if (isIK) {
           if constexpr (kFp8Idx) {
-            storeElemsFp8(index_cache + sm * kHeadDim + dim_base, elems);
+            storeElemsFp8<out_idx_t>(index_cache + sm * kHeadDim + dim_base,
+                                     elems);
           } else {
             storeElems<scalar_t>(index_cache + sm * kHeadDim + dim_base, elems);
           }
@@ -527,9 +541,10 @@ void launchFusedMiniMaxM3(
     int const nq, int const nkv, int const niq, int const block_size,
     int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
     int64_t const kv_s_dim, bool const has_index, bool const insert_kv,
-    bool const process_index, bool const fp8_idx, cudaStream_t stream) {
-  // Index outputs are scalar_t (bf16) or e4m3 bytes (uint8_t); reinterpret the
-  // void* pointers per instantiation in the LAUNCH macro.
+    bool const process_index, bool const fp8_idx,
+    [[maybe_unused]] bool const idx_fnuz, cudaStream_t stream) {
+  // Index outputs are scalar_t (bf16) or one of the two e4m3 flavours;
+  // reinterpret the void* pointers per instantiation in the LAUNCH macro.
   // Slot count must match the kernel's compile-time gating.
   int const v_slots = insert_kv ? nkv : 0;
   int const idx_slots = process_index ? niq + 1 : 0;
@@ -565,7 +580,8 @@ void launchFusedMiniMaxM3(
         fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt, OUT_T, \
                                               HAS_INDEX, INSERT,               \
                                               PROCESS_INDEX, FP8>,             \
-        qkv, q_out, q_fp8_out, reinterpret_cast<OUT_T*>(index_q_out),          \
+        qkv, q_out, q_fp8_out,                                                  \
+        reinterpret_cast<OUT_T*>(index_q_out),                                 \
         q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions,    \
         slot_mapping, index_slot_mapping, kv_cache,                            \
         reinterpret_cast<OUT_T*>(index_cache), eps, q_fp8_inv_scale,           \
@@ -578,13 +594,27 @@ void launchFusedMiniMaxM3(
     fusedMiniMaxM3QNormRopeKVInsertKernel<                                  \
         scalar_t, cache_t, kv_dt, OUT_T, HAS_INDEX, INSERT, PROCESS_INDEX,  \
         FP8><<<grid, kBlockSize, 0, stream>>>(                              \
-        qkv, q_out, q_fp8_out, reinterpret_cast<OUT_T*>(index_q_out),       \
+        qkv, q_out, q_fp8_out,                                               \
+        reinterpret_cast<OUT_T*>(index_q_out),                              \
         q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions, \
         slot_mapping, index_slot_mapping, kv_cache,                         \
         reinterpret_cast<OUT_T*>(index_cache), eps, q_fp8_inv_scale,        \
         rotary_dim, num_tokens, nq, nkv, niq, block_size, kv_s_block,       \
         kv_s_head, kv_s_token, kv_s_dim)
   // clang-format on
+#endif
+
+// The host guard has already rejected the flavour this device cannot convert.
+#ifdef USE_ROCM
+  #define LAUNCH_FP8_IDX(HAS_INDEX, INSERT)                \
+    if (idx_fnuz) {                                        \
+      LAUNCH(HAS_INDEX, INSERT, true, true, Fp8E4M3Fnuz);  \
+    } else {                                               \
+      LAUNCH(HAS_INDEX, INSERT, true, true, Fp8E4M3);      \
+    }
+#else
+  #define LAUNCH_FP8_IDX(HAS_INDEX, INSERT) \
+    LAUNCH(HAS_INDEX, INSERT, true, true, Fp8E4M3)
 #endif
 
   if (has_index) {
@@ -596,15 +626,13 @@ void launchFusedMiniMaxM3(
       }
     } else if (insert_kv) {
       if (fp8_idx) {
-        LAUNCH(true, true, true, true,
-               uint8_t);  // sparse serving, fp8 index outputs
+        LAUNCH_FP8_IDX(true, true);  // sparse serving, fp8 index outputs
       } else {
         LAUNCH(true, true, true, false, scalar_t);  // sparse serving, bf16
       }
     } else {
       if (fp8_idx) {
-        LAUNCH(true, false, true, true,
-               uint8_t);  // sparse profiling, fp8 index_q
+        LAUNCH_FP8_IDX(true, false);  // sparse profiling, fp8 index_q
       } else {
         LAUNCH(true, false, true, false, scalar_t);  // sparse profiling, bf16
       }
@@ -614,6 +642,7 @@ void launchFusedMiniMaxM3(
     // generic Attention layer owns the KV insert).
     LAUNCH(false, false, false, false, scalar_t);
   }
+#undef LAUNCH_FP8_IDX
 #undef LAUNCH
 }
 
@@ -654,7 +683,7 @@ void launchFusedMiniMaxM3(
       static_cast<float>(eps), 1.0f / static_cast<float>(q_fp8_scale),          \
       static_cast<int>(rotary_dim), num_tokens, nq, nkv, niq,                  \
       static_cast<int>(block_size), kv_s_block, kv_s_head, kv_s_token,         \
-      kv_s_dim, has_index, insert_kv, process_index, fp8_idx, stream)
+      kv_s_dim, has_index, insert_kv, process_index, fp8_idx, idx_fnuz, stream)
 // clang-format on
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -778,14 +807,18 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
           kv_cache->scalar_type() == torch::headeronly::ScalarType::Byte,
           "fp8 kv_cache must use uint8 storage");
     }
-    // Indexer index-K cache: independent dtype -- qkv dtype or fp8 e4m3.
+    // Indexer index-K cache: independent dtype -- qkv dtype or either fp8 e4m3
+    // flavour.
     if (process_index) {
       STD_TORCH_CHECK(
           index_cache.has_value() &&
               (index_cache->scalar_type() == qkv.scalar_type() ||
                index_cache->scalar_type() ==
-                   torch::headeronly::ScalarType::Float8_e4m3fn),
-          "insert mode requires index_cache matching qkv dtype or fp8 e4m3");
+                   torch::headeronly::ScalarType::Float8_e4m3fn ||
+               index_cache->scalar_type() ==
+                   torch::headeronly::ScalarType::Float8_e4m3fnuz),
+          "insert mode requires index_cache matching qkv dtype or fp8 e4m3 "
+          "(e4m3fn or e4m3fnuz)");
     }
     STD_TORCH_CHECK(kv_cache->dim() == 4 && kv_cache->stride(3) == 1,
                     "kv_cache must be [nb,nkv,bs,2*head_dim] with contiguous "
@@ -813,10 +846,21 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
         "q_out must have num_tokens * num_heads * 128 elements");
   }
   if (q_fp8_out.has_value()) {
+    // Native e4m3 flavour only, same rule as the index outputs below: the other
+    // one has no convert on this device. Matches scaled_fp8_quant, which also
+    // emits current_platform.fp8_dtype().
+#ifdef USE_ROCM
+    auto const q_fp8_expected =
+        vllm::minimax_m3_fused_ops::devicePrefersFnuzFp8()
+            ? torch::headeronly::ScalarType::Float8_e4m3fnuz
+            : torch::headeronly::ScalarType::Float8_e4m3fn;
+#else
+    auto const q_fp8_expected = torch::headeronly::ScalarType::Float8_e4m3fn;
+#endif
     STD_TORCH_CHECK(q_fp8_out->is_cuda() && q_fp8_out->is_contiguous() &&
-                        q_fp8_out->scalar_type() ==
-                            torch::headeronly::ScalarType::Float8_e4m3fn,
-                    "q_fp8_out must be a contiguous CUDA fp8 e4m3 tensor");
+                        q_fp8_out->scalar_type() == q_fp8_expected,
+                    "q_fp8_out must be a contiguous CUDA tensor of this "
+                    "device's fp8 e4m3 dtype");
     STD_TORCH_CHECK(
         q_fp8_out->numel() == static_cast<int64_t>(num_tokens) * nq * kHeadDim,
         "q_fp8_out must have num_tokens * num_heads * 128 elements");
@@ -830,8 +874,11 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
         index_q_out->is_cuda() && index_q_out->is_contiguous() &&
             (index_q_out->scalar_type() == qkv.scalar_type() ||
              index_q_out->scalar_type() ==
-                 torch::headeronly::ScalarType::Float8_e4m3fn),
-        "index_q_out must be contiguous CUDA, qkv dtype or fp8 e4m3");
+                 torch::headeronly::ScalarType::Float8_e4m3fn ||
+             index_q_out->scalar_type() ==
+                 torch::headeronly::ScalarType::Float8_e4m3fnuz),
+        "index_q_out must be contiguous CUDA, qkv dtype or fp8 e4m3 "
+        "(e4m3fn or e4m3fnuz)");
     STD_TORCH_CHECK(index_q_out->numel() ==
                         static_cast<int64_t>(num_tokens) * niq * kHeadDim,
                     "index_q_out must have num_tokens * num_index_heads * 128 "
@@ -839,19 +886,45 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
   }
 
   // fp8 index path: the index-K cache and index-Q outputs are e4m3 bytes while
-  // q/k/v + q_out stay qkv dtype. Both index outputs must agree.
+  // q/k/v + q_out stay qkv dtype. Both index outputs must agree on the flavour,
+  // since the kernel is instantiated per flavour.
   auto const kFp8 = torch::headeronly::ScalarType::Float8_e4m3fn;
+  auto const kFp8Fnuz = torch::headeronly::ScalarType::Float8_e4m3fnuz;
+  auto const is_fp8_e4m3 = [&](torch::headeronly::ScalarType t) {
+    return t == kFp8 || t == kFp8Fnuz;
+  };
   bool const fp8_idx =
       process_index &&
-      ((index_cache.has_value() && index_cache->scalar_type() == kFp8) ||
-       (index_q_out.has_value() && index_q_out->scalar_type() == kFp8));
+      ((index_cache.has_value() && is_fp8_e4m3(index_cache->scalar_type())) ||
+       (index_q_out.has_value() && is_fp8_e4m3(index_q_out->scalar_type())));
+  bool idx_fnuz = false;
   if (fp8_idx) {
     STD_TORCH_CHECK(
-        !index_cache.has_value() || index_cache->scalar_type() == kFp8,
+        !index_cache.has_value() || is_fp8_e4m3(index_cache->scalar_type()),
         "fp8 index path: index_cache must be fp8 e4m3");
     STD_TORCH_CHECK(
-        !index_q_out.has_value() || index_q_out->scalar_type() == kFp8,
+        !index_q_out.has_value() || is_fp8_e4m3(index_q_out->scalar_type()),
         "fp8 index path: index_q_out must be fp8 e4m3");
+    if (index_cache.has_value() && index_q_out.has_value()) {
+      STD_TORCH_CHECK(
+          index_cache->scalar_type() == index_q_out->scalar_type(),
+          "fp8 index path: index_cache and index_q_out must use the same e4m3 "
+          "flavour");
+    }
+    idx_fnuz = index_cache.has_value()
+                   ? index_cache->scalar_type() == kFp8Fnuz
+                   : index_q_out->scalar_type() == kFp8Fnuz;
+#ifdef USE_ROCM
+    bool const want_fnuz = vllm::minimax_m3_fused_ops::devicePrefersFnuzFp8();
+    STD_TORCH_CHECK(idx_fnuz == want_fnuz,
+                    "fp8 index cache must be ",
+                    want_fnuz ? "float8_e4m3fnuz" : "float8_e4m3fn",
+                    " on this device (see current_platform.fp8_dtype()); the "
+                    "other e4m3 flavour has no conversion instruction here");
+#else
+    STD_TORCH_CHECK(!idx_fnuz,
+                    "fp8 index cache must be float8_e4m3fn on CUDA");
+#endif
   }
 
   const torch::stable::accelerator::DeviceGuard device_guard(

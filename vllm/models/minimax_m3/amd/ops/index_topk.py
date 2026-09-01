@@ -19,7 +19,7 @@ import functools
 import torch
 
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx950, on_mi3xx
+from vllm.platforms.rocm import on_mi3xx
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 from vllm.utils.platform_utils import num_compute_units
@@ -27,8 +27,9 @@ from vllm.utils.platform_utils import num_compute_units
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 
-# The fp8 index cache is implemented and measured on gfx950 only.
-TRITON_INDEXER_KV_DTYPES = ("bf16", "fp8", "fp8_e4m3") if on_gfx950() else ("bf16",)
+# The fp8 index cache needs a native e4m3 convert: FNUZ on gfx942, OCP on
+# gfx950. gfx90a has neither.
+TRITON_INDEXER_KV_DTYPES = ("bf16", "fp8") if on_mi3xx() else ("bf16",)
 
 # Query rows per program in the prefill scorer. 128 is swept on MI3xx; other
 # archs keep the original 64 until they are (cf. _SPARSE_ATTN_SUB_K in

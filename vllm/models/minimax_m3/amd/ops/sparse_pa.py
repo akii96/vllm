@@ -10,7 +10,11 @@ except ModuleNotFoundError:
     import triton
     import triton.language as tl
 
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_fp8_min_max,
+)
 from vllm.models.minimax_m3.common.ops.sparse_attn import SPARSE_BLOCK_SIZE
+from vllm.platforms import current_platform
 
 ASM_PAGE_SIZE = 16
 PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE
@@ -279,9 +283,28 @@ def _insert_index_cache_kernel(
     value = tl.load(src, mask=offs_d < HEAD_DIM, other=0.0)
     if FP8_OUT:
         # e4m3 has no infinity, so an out-of-range convert is undefined; clamp
-        # explicitly, matching the fused CUDA writer.
+        # explicitly. Either writer can populate this cache, so the bound must
+        # match quant_type_max<T> in the fused writer.
         value = tl.clamp(value.to(tl.float32), FP8_MIN, FP8_MAX)
     tl.store(dst, value.to(dst.dtype.element_ty), mask=mask)
+
+
+def _fp8_clamp_bounds(dtype: torch.dtype) -> tuple[float, float]:
+    """Saturation bounds for an fp8 index cache of ``dtype``.
+
+    ``get_fp8_min_max()`` reports the platform's range, not the buffer's, so it
+    only applies once the buffer really is fnuz (same guard as
+    deepseek_v4/common/ops/cache_utils.py).
+    """
+    if dtype == torch.float8_e4m3fnuz:
+        if not current_platform.is_fp8_fnuz():
+            raise ValueError(
+                "float8_e4m3fnuz index cache requires a platform whose fp8 "
+                "format is fnuz"
+            )
+        return get_fp8_min_max()
+    finfo = torch.finfo(dtype)
+    return finfo.min, finfo.max
 
 
 @torch.no_grad()
@@ -304,10 +327,7 @@ def minimax_m3_insert_index_cache(
 
     head_dim = index_k.shape[1]
     fp8_out = index_cache.element_size() == 1
-    # Bounds from the buffer, not the platform: the cache dtype is pinned to
-    # e4m3fn, so a platform-derived range would disagree on fnuz parts.
-    finfo = torch.finfo(index_cache.dtype)
-    fp8_min, fp8_max = (finfo.min, finfo.max) if fp8_out else (0.0, 0.0)
+    fp8_min, fp8_max = _fp8_clamp_bounds(index_cache.dtype) if fp8_out else (0.0, 0.0)
     _insert_index_cache_kernel[(index_k.shape[0],)](
         index_k,
         index_cache,

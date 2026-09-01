@@ -16,9 +16,21 @@ import pytest
 import torch
 
 import vllm._custom_ops as ops
+from vllm.platforms import current_platform
 
 HEAD_DIM = 128
 ROTARY_DIM = 64
+
+
+def _fp8_index_dtype() -> torch.dtype | None:
+    """The e4m3 flavour this device can convert to, or None if it cannot."""
+    if not torch.cuda.is_available():
+        return None
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_mi3xx
+
+        return current_platform.fp8_dtype() if on_mi3xx() else None
+    return torch.float8_e4m3fn if current_platform.has_device_capability(89) else None
 
 
 def _op_available() -> bool:
@@ -211,7 +223,7 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
     q_fp8 = torch.empty(
         num_tokens,
         qsz,
-        dtype=torch.float8_e4m3fn,
+        dtype=current_platform.fp8_dtype(),
         device=device,
     )
     index_q = torch.empty(num_tokens, iqsz, dtype=dtype, device=device)
@@ -446,12 +458,14 @@ def test_sparse_skip_index_branch(num_tokens, block_size, kv_cache_dtype):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
-    reason="e4m3 conversion requires CUDA SM89+.",
+    _fp8_index_dtype() is None,
+    reason="no native e4m3 conversion on this device (needs CUDA SM89+, "
+    "gfx942 or gfx950).",
 )
 @pytest.mark.parametrize("num_tokens", [1, 7, 64, 513])
 @pytest.mark.parametrize("block_size", [16, 64])
 def test_sparse_full_fp8_index(num_tokens, block_size):
+    index_fp8_dtype = _fp8_index_dtype()
     torch.manual_seed(1)
     device, dtype, eps = "cuda", torch.bfloat16, 1e-6
     base, max_pos = 5_000_000.0, 4096
@@ -517,10 +531,10 @@ def test_sparse_full_fp8_index(num_tokens, block_size):
         return qkv, kv_cache, index_cache, q_out, index_q
 
     qkv_bf, kvc_bf, idxc_bf, qo_bf, iq_bf = run(torch.bfloat16)
-    qkv_fp, kvc_fp, idxc_fp, qo_fp, iq_fp = run(torch.float8_e4m3fn)
+    qkv_fp, kvc_fp, idxc_fp, qo_fp, iq_fp = run(index_fp8_dtype)
 
-    assert iq_fp.dtype == torch.float8_e4m3fn
-    assert idxc_fp.dtype == torch.float8_e4m3fn
+    assert iq_fp.dtype == index_fp8_dtype
+    assert idxc_fp.dtype == index_fp8_dtype
 
     # (1) The main branch (q/k/v in qkv, q_out, kv cache) must be bit-identical:
     # the index output dtype must not perturb anything else.
@@ -531,3 +545,62 @@ def test_sparse_full_fp8_index(num_tokens, block_size):
     # (2) Dequantized e4m3 index outputs match the bf16 reference within fp8 ulp.
     torch.testing.assert_close(iq_fp.float(), iq_bf.float(), rtol=0.13, atol=0.05)
     torch.testing.assert_close(idxc_fp.float(), idxc_bf.float(), rtol=0.13, atol=0.05)
+
+
+@pytest.mark.skipif(
+    _fp8_index_dtype() is None,
+    reason="no native e4m3 conversion on this device.",
+)
+def test_sparse_fp8_index_rejects_foreign_e4m3_flavour():
+    """The flavour the device lacks must be refused on the host, since its
+    conversion compiles to a trap with no diagnostic left."""
+    native = _fp8_index_dtype()
+    foreign = (
+        torch.float8_e4m3fn
+        if native == torch.float8_e4m3fnuz
+        else torch.float8_e4m3fnuz
+    )
+    device, dtype, eps = "cuda", torch.bfloat16, 1e-6
+    num_tokens, block_size = 8, 16
+    num_heads, num_kv_heads, num_idx_heads = 16, 4, 4
+    qsz, kvsz = num_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
+    iqsz, iksz = num_idx_heads * HEAD_DIM, HEAD_DIM
+
+    def w():
+        return torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
+
+    qkv = torch.randn(
+        num_tokens, qsz + 2 * kvsz + iqsz + iksz, dtype=dtype, device=device
+    )
+    num_blocks = num_tokens // block_size + 2
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+
+    with pytest.raises(RuntimeError, match="e4m3"):
+        ops.fused_minimax_m3_qknorm_rope_kv_insert(
+            qkv,
+            w(),
+            w(),
+            make_cos_sin_cache(4096, ROTARY_DIM, 5_000_000.0, dtype, device),
+            torch.arange(num_tokens, dtype=torch.int64, device=device),
+            num_heads,
+            num_kv_heads,
+            ROTARY_DIM,
+            eps,
+            w(),
+            w(),
+            num_idx_heads,
+            slot_mapping,
+            slot_mapping,
+            torch.zeros(
+                num_blocks,
+                num_kv_heads,
+                block_size,
+                2 * HEAD_DIM,
+                dtype=dtype,
+                device=device,
+            ),
+            torch.zeros(num_blocks, block_size, HEAD_DIM, dtype=foreign, device=device),
+            block_size,
+            torch.empty(num_tokens, qsz, dtype=dtype, device=device),
+            torch.empty(num_tokens, iqsz, dtype=foreign, device=device),
+        )
