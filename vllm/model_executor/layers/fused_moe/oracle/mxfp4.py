@@ -703,8 +703,11 @@ def select_deepseek_v4_mxfp4_moe_backend(
         current_platform.is_rocm()
         and config.routing_method == RoutingMethodType.DeepseekV4
     ):
+        # AITER_MXFP4_BF16 is CK and gfx950-only, so listing it alone leaves
+        # gfx942 on Triton-unfused; the Triton W4A16 variant covers gfx942.
         priority_backends = [
             Mxfp4MoeBackend.AITER_MXFP4_BF16,
+            Mxfp4MoeBackend.AITER_TRITON_MXFP4_BF16,
             Mxfp4MoeBackend.TRITON_UNFUSED,
         ]
     else:
