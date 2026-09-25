@@ -573,7 +573,25 @@ def triton_reshape_and_cache_flash_diffkv(
     # heuristics instead of autotuning
     TILE_SIZE = max(head_size_k, head_size_v)
     TILE_SIZE = triton.next_power_of_2(TILE_SIZE)
-    if current_platform.is_rocm() or current_platform.is_xpu():
+    if current_platform.is_rocm():
+        num_stages = 4
+        # The launch grid is (num_tokens, num_heads) and is already very wide
+        # (8192 tokens x 2 KV heads = 16384 workgroups for one prefill), so
+        # nothing is gained from large workgroups -- there is always ample
+        # independent work in flight.  What *does* matter is how many elements
+        # each lane owns: Triton spreads the TILE_SIZE-wide tile over
+        # num_warps * 64 lanes, so a large num_warps starves every lane and the
+        # backend degrades the KV-cache access from a vector memory op into a
+        # per-element one.  Measured on gfx950, TILE_SIZE=256, bf16:
+        #   num_warps=8 -> 0.5 elem/lane -> buffer_load_ushort / buffer_store_short
+        #   num_warps=4 -> 1.0 elem/lane -> buffer_load_ushort / buffer_store_short
+        #   num_warps=2 -> 2.0 elem/lane -> buffer_load_dword  / buffer_store_dword
+        #   num_warps=1 -> 4.0 elem/lane -> buffer_load_dwordx2/ buffer_store_dwordx2
+        # Keeping >=4 elements per lane is what turns the KV-cache write into a
+        # dwordx2 store; worth ~2-3x on prefill for every head-dim pair measured
+        # and never slower than the previous unconditional num_warps=8.
+        num_warps = 1 if TILE_SIZE <= 512 else 2
+    elif current_platform.is_xpu():
         num_stages = 4
         num_warps = 8
     else:  # cuda
