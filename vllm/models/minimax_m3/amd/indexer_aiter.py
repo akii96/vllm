@@ -225,6 +225,10 @@ class MiniMaxM3IndexerAiterMetadata(MiniMaxM3IndexerMetadata):
     prefill_row_req_id: torch.Tensor | None = None
     # [num_prefill_tokens] int32, causal token count (position + 1) per row.
     prefill_kv_lens: torch.Tensor | None = None
+    # [num_index_heads, max_num_batched_tokens, width] fp32 scratch the score
+    # passes write and the top-k reads, shared by every layer. None falls back
+    # to a per-call allocation.
+    score_buffer: torch.Tensor | None = None
 
 
 class MiniMaxM3IndexerAiterMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
@@ -250,6 +254,23 @@ class MiniMaxM3IndexerAiterMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             max_tokens, dtype=torch.int32, device=device
         )
         self.kv_lens_buffer = torch.empty(max_tokens, dtype=torch.int32, device=device)
+        # One score buffer for every layer and both sides of the batch, sized
+        # for the launch-time bound so its address and strides survive
+        # cudagraph replay. Decode takes rows [0, nd) and prefill [nd, ntok),
+        # which are disjoint within a forward. The AITER score kernels write it
+        # in place, so this replaces a per-layer allocation whose extent at
+        # long context is the largest tensor in the indexer.
+        self.score_buffer = torch.empty(
+            (
+                self.num_index_heads,
+                max_tokens,
+                score_block_width(
+                    vllm_config.model_config.max_model_len, self.sparse_block_size
+                ),
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
 
     def build(
         self,
@@ -356,6 +377,7 @@ class MiniMaxM3IndexerAiterMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             prefill_num_valid_pages=prefill_num_valid_pages,
             prefill_row_req_id=prefill_row_req_id,
             prefill_kv_lens=prefill_kv_lens,
+            score_buffer=self.score_buffer,
         )
 
 
@@ -431,6 +453,33 @@ class MiniMaxM3IndexerAiterImpl(MiniMaxM3IndexerImpl):
             device=self.index_cache.kv_cache.device,
         )
 
+    def _score_rows(
+        self,
+        score_buffer: torch.Tensor | None,
+        lo: int,
+        hi: int,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        """Score rows ``[lo, hi)``, from the shared buffer when there is one.
+
+        The slice keeps the block axis contiguous and only narrows the leading
+        two, which is what the AITER passes require of it: they take the head
+        and row strides but index the block axis directly.
+
+        Args:
+            score_buffer: The builder's shared buffer, or None to allocate.
+            lo: First score row, inclusive.
+            hi: Last score row, exclusive.
+            max_seq_len: Launch-time context bound, which fixes the width.
+
+        Returns:
+            A ``[num_index_heads, hi - lo, width]`` fp32 view or tensor.
+        """
+        if score_buffer is None:
+            return self._new_score(hi - lo, max_seq_len)
+        width = score_block_width(max_seq_len, self.block_size)
+        return score_buffer[:, lo:hi, :width]
+
     def forward(
         self,
         index_query: torch.Tensor,
@@ -484,7 +533,7 @@ class MiniMaxM3IndexerAiterImpl(MiniMaxM3IndexerImpl):
                 "the AITER indexer's top-k emits the attend's page table and "
                 "needs the page-16 rebase of the attend's decode block table"
             )
-            score = self._new_score(nd, d.max_seq_len)
+            score = self._score_rows(md.score_buffer, 0, nd, d.max_seq_len)
             pa_sparse_block_score_decode(
                 iq[:nd],
                 kv,
@@ -525,7 +574,9 @@ class MiniMaxM3IndexerAiterImpl(MiniMaxM3IndexerImpl):
             assert md.prefill_num_valid_pages is not None
             assert md.prefill_row_req_id is not None
             assert md.prefill_kv_lens is not None
-            score = self._new_score(num_tokens - nd, p.max_seq_len)
+            score = self._score_rows(
+                md.score_buffer, nd, num_tokens, p.max_seq_len
+            )
             pa_sparse_block_score_prefill(
                 iq[nd:],
                 kv,
