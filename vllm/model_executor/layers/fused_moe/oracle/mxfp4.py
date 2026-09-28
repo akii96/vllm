@@ -767,16 +767,21 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     elif current_platform.is_rocm():
         from vllm.platforms.rocm import get_cdna_version
 
-        is_situ_or_silu = activation in (
+        act_supports_128 = activation in (
             MoEActivation.SITU,
             MoEActivation.SILU,
+            MoEActivation.SWIGLUOAI,
         )
 
-        # K3's AITER A16W4 SiTU kernel handles K3's native intermediate size
-        # (moe_intermediate 3072; e.g. 384/partition at TP8). Align to 128
-        # rather than the generic ROCm 256 round-up, which would inflate
-        # weights and OOM.
-        aiter_uses_128 = backend == Mxfp4MoeBackend.AITER_MXFP4_BF16
+        # The AITER MoE kernels handle a native intermediate size that is a
+        # multiple of 128 (moe_intermediate 3072; e.g. 384/partition at TP8).
+        # Align to 128 rather than the generic ROCm 256 round-up, which would
+        # inflate weights and OOM. Covers A16W4 SiTU (K3) and A4W4 SwiGLU-OAI
+        # (MiniMax-M3): both dispatch 384 correctly, verified on gfx950.
+        aiter_uses_128 = backend in (
+            Mxfp4MoeBackend.AITER_MXFP4_BF16,
+            Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
+        )
 
         # matmul_ogs uses block_k=128 for MXFP4 on pre-CDNA4 GPUs.
         # CDNA4's F16xMXFP4 configuration uses block_k=256.
@@ -785,7 +790,7 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         )
 
         alignment = (
-            128 if is_situ_or_silu and (aiter_uses_128 or triton_uses_128) else 256
+            128 if act_supports_128 and (aiter_uses_128 or triton_uses_128) else 256
         )
 
         intermediate_size = round_up(intermediate_size, alignment)
