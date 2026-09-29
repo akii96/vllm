@@ -48,8 +48,10 @@ logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 
 # Below this, 3D costs more in fp32 partials and the reduce kernel than the
-# split buys back. gfx950 crossover; untested elsewhere, hence the arch gate.
-MIN_KV_TOKENS_PER_SOFTMAX_SEGMENT = 256
+# split buys back. gfx950 crossover sits between 64 and 80 tokens/segment for
+# every head count and batch size measured; larger values send shapes whose
+# 3D was already faster back onto the 2D path.
+MIN_KV_TOKENS_PER_SOFTMAX_SEGMENT = 80
 
 # 8 workgroups/CU is 2 waves/SIMD at num_warps=1, the minimum for one wave's
 # latency to be covered by another. Below it, keep Triton's default launch.
@@ -75,14 +77,12 @@ def _select_launch_config(
     (LDS 24576 -> 16384 B). That costs thread-level parallelism, so it only
     pays on a full grid -- 2D prefill and 2D decode compile to the same kernel
     yet single-wave wins 1.48x on one and loses on the other, separated only by
-    occupancy. The 3D path needs no gate; ``num_stages=3`` pipelines within the
-    wave. Launch metadata cannot change numerics.
+    occupancy. 3D keeps the defaults: its grid is already split across segments,
+    and forcing one wave there cost up to 26% on gfx950. Launch metadata cannot
+    change numerics.
     """
-    if BLOCK_M > 16 or not _is_tuned_arch():
+    if BLOCK_M > 16 or use_3d or not _is_tuned_arch():
         return {}
-
-    if use_3d:
-        return {"num_warps": 1, "num_stages": 3, "waves_per_eu": 2}
 
     device_id = device.index if device.index is not None else 0
     cus = current_platform.num_compute_units(device_id)
