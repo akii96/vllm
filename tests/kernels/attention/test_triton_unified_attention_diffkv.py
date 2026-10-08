@@ -229,19 +229,27 @@ def _decode_batch(kv_lens, num_query_heads, num_kv_heads, head_sizes):
     return query, kv_cache, block_tables
 
 
-def _run_decode(query, kv_cache, block_tables, kv_lens, window, sinks, num_segments):
+def _run_diffkv(
+    query, kv_cache, block_tables, kv_lens, window, sinks, num_segments, query_lens
+):
+    """query_lens=None is a decode batch (one query per sequence)."""
     num_seqs, num_query_heads, head_size_qk = query.shape
     head_size_v = kv_cache.shape[-1] - head_size_qk
-    out = torch.empty(num_seqs, num_query_heads, head_size_v, dtype=query.dtype)
+    if query_lens is None:
+        query_lens = [1] * num_seqs
+    out = torch.empty(sum(query_lens), num_query_heads, head_size_v, dtype=query.dtype)
     segm_output, segm_max, segm_expsum = _alloc_segm_buffers(
         num_seqs, num_query_heads, head_size_v
+    )
+    cu_seqlens_q = torch.tensor([0, *query_lens], dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
     )
     unified_attention_diffkv(
         q=query,
         k=kv_cache[..., :head_size_qk],
         v=kv_cache[..., head_size_qk:],
         out=out,
-        cu_seqlens_q=torch.arange(num_seqs + 1, dtype=torch.int32),
+        cu_seqlens_q=cu_seqlens_q,
         seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
         softmax_scale=head_size_qk**-0.5,
         causal=True,
@@ -249,6 +257,7 @@ def _run_decode(query, kv_cache, block_tables, kv_lens, window, sinks, num_segme
         block_table=block_tables,
         softcap=0,
         sinks=sinks,
+        max_seqlen_q=max(query_lens),
         seq_threshold_3D=num_seqs if num_segments else 0,
         num_par_softmax_segments=num_segments or NUM_PAR_SOFTMAX_SEGMENTS,
         softmax_segm_output=segm_output,
@@ -256,6 +265,12 @@ def _run_decode(query, kv_cache, block_tables, kv_lens, window, sinks, num_segme
         softmax_segm_expsum=segm_expsum,
     )
     return out
+
+
+def _run_decode(query, kv_cache, block_tables, kv_lens, window, sinks, num_segments):
+    return _run_diffkv(
+        query, kv_cache, block_tables, kv_lens, window, sinks, num_segments, None
+    )
 
 
 def _ref_window_decode(query, kv_cache, block_tables, kv_lens, window, sinks):
@@ -330,6 +345,146 @@ def test_triton_unified_attn_diffkv_launch_config_is_bitwise_invariant(
         )
         outs.append(_run_decode(query, kv_cache, block_tables, kv_lens, 128, None, 0))
     assert torch.equal(outs[0], outs[1])
+
+
+def _window_ref(query, kv_cache, block_tables, query_lens, kv_lens, window):
+    """Reference for a windowed prefill batch: token at absolute position
+    ``p`` attends keys ``(p - window, p]``."""
+    num_kv_heads = kv_cache.shape[2]
+    head_size_qk = query.shape[-1]
+    flat = kv_cache.float()
+    outs = []
+    offset = 0
+    for seq_idx, (q_len, kv_len) in enumerate(zip(query_lens, kv_lens)):
+        kv = flat[block_tables[seq_idx]].flatten(0, 1)[:kv_len]
+        k = kv[..., :head_size_qk].repeat_interleave(
+            query.shape[1] // num_kv_heads, dim=1
+        )
+        v = kv[..., head_size_qk:].repeat_interleave(
+            query.shape[1] // num_kv_heads, dim=1
+        )
+        rows = []
+        for m in range(q_len):
+            p = kv_len - q_len + m
+            keys = torch.arange(max(0, p - window + 1), p + 1)
+            q = query[offset + m].float()
+            scores = torch.einsum("hd,khd->hk", q, k[keys]) * head_size_qk**-0.5
+            probs = scores.softmax(dim=-1)
+            rows.append(torch.einsum("hk,khd->hd", probs, v[keys]))
+        outs.append(torch.stack(rows))
+        offset += q_len
+    return torch.cat(outs).to(query.dtype)
+
+
+@pytest.mark.parametrize("sliding_window", [128, 1024])
+@torch.inference_mode()
+def test_triton_unified_attn_diffkv_2d_prefill(sliding_window: int) -> None:
+    """Windowed prefill must match the reference on the 2D path."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    w = sliding_window
+    query_lens = [9, 33]
+    kv_lens = [w + 200, w + 512]
+    _, kv_cache, block_tables = _decode_batch(kv_lens, 16, 2, (192, 128))
+    query = torch.randn(sum(query_lens), 16, 192, dtype=torch.bfloat16)
+    expected = _window_ref(query, kv_cache, block_tables, query_lens, kv_lens, w)
+
+    actual = _run_diffkv(
+        query,
+        kv_cache,
+        block_tables,
+        kv_lens,
+        w,
+        None,
+        0,  # 2D path
+        query_lens,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+def test_triton_unified_attn_diffkv_prefill_selects_single_wave_2d(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """max_seqlen_q > 1 covers prefills: the single-wave 2D launch triggers
+    there too, and its numerics match the 4-warp launch bitwise."""
+    import vllm.v1.attention.ops.triton_unified_attention_diffkv as diffkv
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    query_lens = [17, 257]
+    kv_lens = [2000, 9000]
+    _, kv_cache, block_tables = _decode_batch(kv_lens, 16, 2, (192, 128))
+    query = torch.randn(sum(query_lens), 16, 192, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(diffkv, "_is_tuned_arch", lambda: True)
+    monkeypatch.setattr(diffkv, "_num_compute_units", lambda _=None: 1)
+
+    seen = []
+    real_use = diffkv._use_single_wave_2d
+
+    def spy(*args):
+        seen.append((args[2], real_use(*args)))  # args[2] is max_seqlen_q
+        return seen[-1][1]
+
+    monkeypatch.setattr(diffkv, "_use_single_wave_2d", spy)
+    segm_output, segm_max, segm_expsum = _alloc_segm_buffers(len(kv_lens), 16, 128)
+    out = torch.empty(sum(query_lens), 16, 128, dtype=torch.bfloat16)
+    unified_attention_diffkv(
+        q=query,
+        k=kv_cache[..., :192],
+        v=kv_cache[..., 192:],
+        out=out,
+        cu_seqlens_q=torch.tensor([0, *query_lens], dtype=torch.int32),
+        seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
+        softmax_scale=192**-0.5,
+        causal=True,
+        window_size=(127, 0),
+        block_table=block_tables,
+        softcap=0,
+        max_seqlen_q=max(query_lens),
+        seq_threshold_3D=len(kv_lens),
+        num_par_softmax_segments=NUM_PAR_SOFTMAX_SEGMENTS,
+        softmax_segm_output=segm_output,
+        softmax_segm_max=segm_max,
+        softmax_segm_expsum=segm_expsum,
+    )
+
+    # Called once, for a prefill (max_seqlen_q > 1), and engaged.
+    assert len(seen) == 1
+    assert seen[0][0] > 1
+    assert seen[0][1]
+
+    # Bitwise invariance across the launch config on the same prefill batch.
+    outs = []
+    for single_wave in (False, True):
+        monkeypatch.setattr(
+            diffkv, "_use_single_wave_2d", lambda *_, sw=single_wave: sw
+        )
+        outs.append(
+            _run_diffkv(
+                query,
+                kv_cache,
+                block_tables,
+                kv_lens,
+                128,
+                None,
+                0,
+                query_lens,
+            )
+        )
+    assert torch.equal(outs[0], outs[1])
+
+
+@pytest.mark.parametrize("tuned_arch", [False, True])
+def test_window_resplit_gate(monkeypatch: pytest.MonkeyPatch, tuned_arch: bool) -> None:
+    """The window resplit belongs to the gfx950 tuning."""
+    import vllm.v1.attention.ops.triton_unified_attention_diffkv as diffkv
+
+    monkeypatch.setattr(diffkv, "_is_tuned_arch", lambda: tuned_arch)
+    assert diffkv._window_resplit_enabled(128) is tuned_arch
+    assert not diffkv._window_resplit_enabled(0)
 
 
 @pytest.mark.parametrize("tuned_arch", [False, True])

@@ -80,7 +80,10 @@ def _num_kv_segments(
     sliding_window: int,
     tile_size: int,
 ) -> int:
-    """Segments for the 3D decode split, or 0 to launch 2D instead."""
+    """Segments for the 3D decode split, or 0 to launch 2D instead.
+
+    Outside the tuned arch the legacy full-sequence split stands.
+    """
     if sliding_window <= 0 or not _is_tuned_arch():
         return max_segments
     n = max_segments
@@ -101,8 +104,8 @@ def _use_single_wave_2d(
     num_workgroups: int,
     device: torch.device,
 ) -> bool:
-    # Full-attention decode with partly empty Q rows is faster on 4 warps.
-    # Under batch invariance the warp count must not depend on the batch.
+    # Covers decodes with partly empty Q rows and prefills alike; under
+    # batch invariance the warp count must not depend on the batch.
     return (
         block_m <= 16
         and (max_seqlen_q > 1 or sliding_window > 0 or num_queries_per_kv >= block_m)
@@ -113,6 +116,11 @@ def _use_single_wave_2d(
     )
 
 
+def _window_resplit_enabled(sliding_window: int) -> bool:
+    """Whether the 3D split may follow the sliding window; gfx950 only."""
+    return sliding_window > 0 and _is_tuned_arch()
+
+
 @triton.jit
 def compute_3d_segments_diffkv(
     seq_len,
@@ -120,19 +128,19 @@ def compute_3d_segments_diffkv(
     TILE_SIZE: tl.constexpr,
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    WINDOW_RESPLIT: tl.constexpr,
 ):
     """Segment ``i`` covers tiles ``segm_tile_start + [i, i + 1) *
     tiles_per_segment`` and has work iff its first key is below ``seq_len``.
 
-    Splitting the whole sequence leaves a sliding window in one or two
-    segments, so only the window is split. Near the window both splits are
-    equally long and re-splitting only shifts tile alignment, so it is done
-    once it shortens the longest segment by 1.5x. Attention and reduce must
-    agree, so both call this.
+    With ``WINDOW_RESPLIT``, segments cover only the sliding window —
+    splitting the whole sequence would leave it in one or two — taken once
+    that shortens the longest segment by 1.5x. Attention and reduce must
+    agree, so both call this with the same arguments.
     """
     segm_tile_start = 0
     tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
-    if SLIDING_WINDOW > 0:
+    if WINDOW_RESPLIT:
         window_tile_start = tl.maximum(context_len - SLIDING_WINDOW + 1, 0) // TILE_SIZE
         window_tiles_per_segment = cdiv_fn(
             seq_len - window_tile_start * TILE_SIZE, NUM_SEGMENTS_PER_SEQ * TILE_SIZE
@@ -197,6 +205,7 @@ def kernel_unified_attention_diffkv(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    USE_WINDOW_RESPLIT: tl.constexpr,
     # ``IS_3D`` toggles between 2D layout (one program walks the full KV
     # sequence) and 3D layout (split-KV / FlashDecoding-style: per-segm
     # programs write partials, finalized by ``kernel_reduce_segments_diffkv``).
@@ -226,6 +235,7 @@ def kernel_unified_attention_diffkv(
             TILE_SIZE,
             NUM_SEGMENTS_PER_SEQ,
             SLIDING_WINDOW,
+            USE_WINDOW_RESPLIT,
         )
         if (segm_tile_start + segm_idx * tiles_per_segment) * TILE_SIZE >= seq_len:
             return
@@ -431,6 +441,7 @@ def kernel_reduce_segments_diffkv(
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    USE_WINDOW_RESPLIT: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
 ):
     """Combine per-segment partials into the final softmax output.
@@ -450,7 +461,12 @@ def kernel_reduce_segments_diffkv(
     )
 
     segm_tile_start, tiles_per_segment = compute_3d_segments_diffkv(
-        seq_len, seq_len - query_len, TILE_SIZE, NUM_SEGMENTS_PER_SEQ, SLIDING_WINDOW
+        seq_len,
+        seq_len - query_len,
+        TILE_SIZE,
+        NUM_SEGMENTS_PER_SEQ,
+        SLIDING_WINDOW,
+        USE_WINDOW_RESPLIT,
     )
     segm_first_tile = (
         segm_tile_start + tl.arange(0, NUM_SEGMENTS_PER_SEQ) * tiles_per_segment
@@ -562,6 +578,7 @@ def unified_attention_diffkv(
     # smaller tiles to expose more parallelism along the KV dim.
     tile_size_3d = 16 if q.element_size() >= 2 else 32
     num_segments = 1
+    window_resplit = False
     if use_3d:
         assert num_par_softmax_segments is not None
         num_segments = _num_kv_segments(
@@ -572,6 +589,7 @@ def unified_attention_diffkv(
             tile_size_3d,
         )
         use_3d = num_segments > 0
+        window_resplit = _window_resplit_enabled(sliding_window_val)
     tile_size = tile_size_3d if use_3d else 32
 
     launch_num_warps: int | None = None
@@ -653,6 +671,7 @@ def unified_attention_diffkv(
         num_seqs=num_seqs,
         BLOCK_M=BLOCK_M,
         NUM_SEGMENTS_PER_SEQ=num_segments,
+        USE_WINDOW_RESPLIT=window_resplit,
         IS_3D=use_3d,
         **launch_kwargs,
     )
@@ -674,5 +693,6 @@ def unified_attention_diffkv(
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_segments,
+            USE_WINDOW_RESPLIT=window_resplit,
             SLIDING_WINDOW=sliding_window_val,
         )
