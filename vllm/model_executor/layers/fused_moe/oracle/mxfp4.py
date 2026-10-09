@@ -880,7 +880,16 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
             128 if is_situ_or_silu and (aiter_uses_128 or triton_uses_128) else 256
         )
 
-        intermediate_size = round_up(intermediate_size, alignment)
+        # AITER A4W4 SwiGLU-OAI runs a 128-multiple intermediate size natively
+        # (MiniMax-M3 TP8: 384); padding it to 512 only adds zero compute.
+        native_intermediate = (
+            backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+            and activation
+            in (MoEActivation.SWIGLUOAI, MoEActivation.SWIGLUOAI_UNINTERLEAVE)
+            and intermediate_size % 128 == 0
+        )
+        if not native_intermediate:
+            intermediate_size = round_up(intermediate_size, alignment)
         hidden_size = round_up(hidden_size, alignment)
     elif backend == Mxfp4MoeBackend.CPU:
         # CPU AMX kernel uses BLOCK_N=32, align to 32
