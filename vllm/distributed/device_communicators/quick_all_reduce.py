@@ -278,6 +278,7 @@ class QuickAllReduce:
                 rank=self.rank,
                 world_size=self.world_size,
             )
+            self._prepare_flydsl_rmsnorm()
             # QuickAllReduceInt4 rejects payloads above its 4 GiB window.
             self.qr_max_size = min(effective_qr_max_size, 0xFFFFFFFF)
             self.qr_min_size = qr_min_size if qr_min_size is not None else 2 * MB
@@ -377,6 +378,21 @@ class QuickAllReduce:
                 self.qr_quant_level.value
             ]
         return inp_size <= self.qr_max_size and inp_size >= min_size
+
+    def _prepare_flydsl_rmsnorm(self) -> None:
+        """Build the fused-RMSNorm engines for the model's hidden size.
+
+        Wide-tile hidden sizes (6144) build their engines with a collective;
+        doing it at init keeps it out of profiling and CUDA graph capture.
+        """
+        prepare = getattr(self._flydsl_int4, "prepare_rmsnorm", None)
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = getattr(vllm_config, "model_config", None)
+        if prepare is None or model_config is None:
+            return
+        hidden = model_config.get_hidden_size()
+        if self._flydsl_int4.supports_rmsnorm(hidden, 0):
+            prepare(hidden)
 
     def should_fused_allreduce_rmsnorm(
         self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
