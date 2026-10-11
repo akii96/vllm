@@ -143,6 +143,13 @@ vllm serve amd/Qwen3.5-35B-A3B-MXFP4 \
 
 adds MXFP8 quantization to the dense linear layers of a Quark checkpoint where only MOE experts are quantized.
 
+Use `targets` to limit the online method to some of the unquantized layers. For example, `amd/MiniMax-M3-MXFP4` leaves every attention projection in BF16; the following quantizes only the language-model attention projections to per-channel FP8 and keeps the vision tower in BF16:
+
+```bash
+vllm serve amd/MiniMax-M3-MXFP4 \
+  --quantization-config '{"targets": {"re:^language_model\\.model\\.layers\\.\\d+\\.self_attn\\.(qkv_proj|o_proj)$": "fp8_per_channel"}}'
+```
+
 !!! info
     `quantization_config.ignore` is an online-only exclusion: the original `quant_method` relies solely on its own ignore implementation and on the ignored layers specified in `config.json`.
 
