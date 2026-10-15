@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inference-only MiniMax M3 (text backbone) model — AMD ROCm implementation.
+"""Inference-only MiniMax M3 (text backbone) model â€” AMD ROCm implementation.
 
 Self-contained per-platform impl (mirrors ``deepseek_v4/amd``). It is identical
 to ``../nvidia/model.py`` except for RMS normalization: FlashInfer's Gemma
@@ -92,6 +92,7 @@ from vllm.models.minimax_m3.amd.indexer_aiter import (
     MiniMaxM3AiterIndexer,
     select_aiter_indexer_impl_cls,
 )
+from vllm.models.minimax_m3.amd.mono.layer import MonoLayer
 from vllm.models.minimax_m3.amd.ops import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
@@ -232,7 +233,7 @@ def _build_rotary_emb(config: PreTrainedConfig, head_dim: int):
 class MiniMAXGemmaRMSNorm(nn.Module):
     """Gemma-style RMS normalization (native ROCm implementation).
 
-    Normalizes in fp32 and scales by ``(1 + weight)`` — numerically equivalent
+    Normalizes in fp32 and scales by ``(1 + weight)`` â€” numerically equivalent
     to the FlashInfer ``gemma_rmsnorm`` / ``gemma_fused_add_rmsnorm`` kernels
     used in the NVIDIA path, which are unavailable on ROCm. When ``residual`` is
     given, the fused add + norm returns the updated ``(normed, residual)`` pair.
@@ -615,7 +616,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
     This is a merged attention layer: it owns the projections (qkv + index
     q/k), per-head QK norms and RoPE, *and* the attention-backend wiring that a
-    generic ``Attention`` layer would normally provide — it binds the
+    generic ``Attention`` layer would normally provide â€” it binds the
     ``MiniMaxM3SparseBackend`` + main impl, registers the main paged K/V cache,
     and owns the lightning indexer (``MiniMaxM3Indexer``), which holds the
     index-key side cache.
@@ -1333,6 +1334,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = MiniMAXGemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.mono = MonoLayer.create(self, get_current_vllm_config())
 
     def forward(
         self,
@@ -1340,6 +1342,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mono is not None:
+            out = self.mono(self, positions, hidden_states, residual)
+            if out is not None:
+                return out
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -1350,7 +1356,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
-
+        if self.mono is not None:
+            out = self.mono.ffn(self, hidden_states, residual)
+            if out is not None:
+                return out
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
         )
@@ -1683,7 +1692,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
 
 # TODO(refactor): this VL wrapper is platform-agnostic and byte-identical to the
-# NVIDIA copy — it only orchestrates the shared vision tower + the per-platform
+# NVIDIA copy â€” it only orchestrates the shared vision tower + the per-platform
 # language model (resolved via ``init_vllm_registered_model``). Hoist it into
 # ``common/`` to drop the amd/nvidia duplication once the split stabilizes.
 @MULTIMODAL_REGISTRY.register_processor(
