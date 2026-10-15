@@ -116,7 +116,8 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
     ) -> None:
         super().__init__()
         if indexer_kv_dtype in ("fp8", "fp8_e4m3"):
-            cache_dtype = torch.float8_e4m3fn
+            # e4m3fnuz on gfx942, e4m3fn elsewhere.
+            cache_dtype = current_platform.fp8_dtype()
         elif indexer_kv_dtype == "bf16":
             cache_dtype = torch.bfloat16
         else:
@@ -503,7 +504,7 @@ def select_indexer_impl_cls(
     ``sparse_topk_select`` kernel supports), the fmha_sm100 score + top-k path is
     used for both bf16 and fp8 index caches. Everything else falls back to the
     Triton indexer, with fp8 restricted to CUDA platforms that advertise fp8
-    support.
+    support and to ROCm MI3xx.
     """
     if indexer_kv_dtype in ("mxfp4", "nvfp4"):
         raise NotImplementedError(
@@ -512,10 +513,18 @@ def select_indexer_impl_cls(
         )
     is_cuda = current_platform.is_cuda()
     is_fp8 = indexer_kv_dtype in ("fp8", "fp8_e4m3")
-    if is_fp8 and not (is_cuda and current_platform.supports_fp8()):
-        raise NotImplementedError(
-            f"indexer_kv_dtype={indexer_kv_dtype!r} requires CUDA fp8 support."
-        )
+    if is_fp8:
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_mi3xx
+
+            fp8_ok = on_mi3xx()
+        else:
+            fp8_ok = is_cuda and current_platform.supports_fp8()
+        if not fp8_ok:
+            raise NotImplementedError(
+                f"indexer_kv_dtype={indexer_kv_dtype!r} requires CUDA fp8 "
+                "support or ROCm MI3xx."
+            )
     is_sm100 = is_cuda and current_platform.is_device_capability_family(100)
     use_msa = (
         is_sm100
