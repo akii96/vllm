@@ -92,6 +92,7 @@ from vllm.models.minimax_m3.amd.indexer_aiter import (
     MiniMaxM3AiterIndexer,
     select_aiter_indexer_impl_cls,
 )
+from vllm.models.minimax_m3.amd.mono.layer import MonoLayer
 from vllm.models.minimax_m3.amd.ops import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
@@ -1333,6 +1334,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = MiniMAXGemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.mono = MonoLayer.create(self, get_current_vllm_config())
 
     def forward(
         self,
@@ -1350,7 +1352,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
-
+        if self.mono is not None:
+            out = self.mono.ffn(self, hidden_states, residual)
+            if out is not None:
+                return out
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
         )
