@@ -401,6 +401,96 @@ def test_rocm_backend_sliding_window_includes_boundary_token(
     torch.testing.assert_close(output, expected.to(dtype).expand_as(output))
 
 
+@pytest.mark.parametrize("sliding_window", [1, 7, 32, 100])
+@pytest.mark.parametrize("ctx_len", [5, 31, 32, 33, 1000])
+@torch.inference_mode()
+def test_sliding_window_long_context(sliding_window: int, ctx_len: int):
+    """Context far beyond the window, so the kernels start part-way into it.
+
+    Covers windows that do and do not align with the 32-token cache block, and
+    contexts on both sides of a block edge. The old K/V carries large values, so
+    reading any of it would show up in the output.
+    """
+    set_random_seed(0)
+    device, dtype = "cuda:0", torch.float16
+    torch.set_default_device(device)
+    num_heads, num_kv_heads, head_size, block_size = 8, 2, 128, 32
+    # Decode rows go to kernel_paged_attention_2d, longer queries to
+    # context_attention_fwd; mix both.
+    query_lens = [1, 40, 1, 3]
+    seq_lens = [ctx_len + q for q in query_lens]
+    num_tokens = sum(query_lens)
+
+    kv = torch.randn(sum(seq_lens), 2, num_kv_heads, head_size, dtype=dtype)
+    key, value = kv.unbind(dim=1)
+    starts = [0, *torch.tensor(seq_lens).cumsum(0).tolist()]
+    for i, s in enumerate(seq_lens):
+        # Tokens outside every query's window get large values.
+        old = slice(starts[i], starts[i] + max(s - query_lens[i] - sliding_window, 0))
+        value[old] = 100.0
+
+    blocks = [-(-s // block_size) for s in seq_lens]
+    pool = torch.randperm(sum(blocks) + 3).int()
+    block_table = torch.zeros(len(seq_lens), max(blocks), dtype=torch.int32)
+    k_cache = torch.zeros(sum(blocks) + 3, block_size, num_kv_heads, head_size)
+    v_cache = torch.zeros_like(k_cache)
+    k_cache, v_cache = k_cache.to(dtype), v_cache.to(dtype)
+    used = 0
+    for i, s in enumerate(seq_lens):
+        block_table[i, : blocks[i]] = pool[used : used + blocks[i]]
+        used += blocks[i]
+        pos = torch.arange(s)
+        rows = block_table[i, pos // block_size].long()
+        k_cache[rows, pos % block_size] = key[starts[i] : starts[i] + s]
+        v_cache[rows, pos % block_size] = value[starts[i] : starts[i] + s]
+    k_cache = (
+        k_cache.view(-1, block_size, num_kv_heads, head_size // 8, 8)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
+
+    query = torch.randn(num_tokens, num_heads, head_size, dtype=dtype)
+    q_index = torch.cat(
+        [
+            torch.arange(starts[i] + s - q, starts[i] + s)
+            for i, (s, q) in enumerate(zip(seq_lens, query_lens))
+        ]
+    )
+    output = torch.empty_like(query)
+    scale = torch.tensor(1.0, dtype=torch.float32)
+    chunked_prefill_paged_decode(
+        query,
+        key[q_index],
+        value[q_index],
+        output,
+        "auto",
+        k_cache,
+        v_cache,
+        block_table,
+        torch.tensor([0, *query_lens], dtype=torch.int32).cumsum(0).int(),
+        torch.tensor(seq_lens, dtype=torch.int32),
+        max(seq_lens),
+        max(query_lens),
+        scale,
+        scale,
+        sliding_window=sliding_window,
+    )
+
+    mask = create_causal_attention_mask_for_sdpa(
+        query_lens, seq_lens, sliding_window, device=device, dtype=dtype
+    )
+    group = num_heads // num_kv_heads
+    ref = F.scaled_dot_product_attention(
+        query.transpose(0, 1)[None],
+        key.repeat_interleave(group, dim=1).transpose(0, 1)[None],
+        value.repeat_interleave(group, dim=1).transpose(0, 1)[None],
+        attn_mask=mask,
+        scale=head_size**-0.5,
+    )[0].transpose(0, 1)
+    torch.testing.assert_close(output, ref, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("num_queries_per_kv", NUM_QUERIES_PER_KV)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)

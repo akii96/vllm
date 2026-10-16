@@ -245,9 +245,17 @@ def _fwd_kernel(
 
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_PADDED], dtype=tl.float32)  # [M,D]
 
+    # Context before the first query row's window is masked out below; skip it.
+    ctx_start = 0
+    if SLIDING_WINDOW > 0:
+        ctx_start = tl.maximum(
+            cur_batch_ctx_len + start_m * BLOCK_M - SLIDING_WINDOW + 1, 0
+        )
+        ctx_start = ctx_start // BLOCK_SIZE * BLOCK_SIZE
+
     # compute query against context (no causal mask here)
     for start_n in tl.range(
-        0, cur_batch_ctx_len, BLOCK_SIZE, loop_unroll_factor=num_unroll_cache
+        ctx_start, cur_batch_ctx_len, BLOCK_SIZE, loop_unroll_factor=num_unroll_cache
     ):
         # Under a block size of 544 (Qwen/Qwen3-Next-80B-A3B-Thinking),
         # replace one physical block every 17 32-Tile blocks

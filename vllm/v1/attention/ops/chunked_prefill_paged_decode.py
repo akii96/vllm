@@ -146,11 +146,15 @@ def kernel_paged_attention_2d(
         )
 
     num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
+    # Blocks wholly before the window are masked out below; skip their loads.
+    first_block = 0
+    if SLIDING_WINDOW > 0:
+        first_block = tl.maximum(seq_len - SLIDING_WINDOW, 0) // BLOCK_SIZE
 
     offs_n = tl.arange(0, BLOCK_SIZE)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     # iterate through tiles
-    for j in range(0, num_blocks):
+    for j in range(first_block, num_blocks):
         start_n = j * BLOCK_SIZE
         # Calculate the logical location within a non-standard physical block,
         # such as 544 in Qwen/Qwen3-Next-80B-A3B-Thinking.
