@@ -15,13 +15,19 @@ def _quant(strategy, inp="token"):
     return NS(weight_quant=NS(strategy=strategy), input_quant=NS(strategy=inp))
 
 
-def _layer(backend="TRITON", strategy="channel", shared=True, moe=True, layer_id=5):
+def _layer(backend="TRITON", strategy="channel", shared=True, moe=True, layer_id=5,
+           kv="fp8", aiter_pa=False, skip_topk=False):  # fmt: skip
     lin = NS(scheme=_quant(strategy))
     qm = NS(fp8_backend=NS(name=backend), **vars(_quant(strategy)))
     return NS(
         layer_id=layer_id,
         is_moe_layer=moe,
-        self_attn=NS(layer_name="model.layers.5.self_attn.attn"),
+        self_attn=NS(
+            layer_name="model.layers.5.self_attn.attn",
+            kv_cache_dtype=kv,
+            use_aiter_sparse_pa=aiter_pa,
+            skip_index_topk=skip_topk,
+        ),
         block_sparse_moe=NS(
             experts=NS(routed_experts=NS(quant_method=qm)),
             shared_experts=NS(gate_up_proj=lin, down_proj=lin) if shared else None,
@@ -29,10 +35,11 @@ def _layer(backend="TRITON", strategy="channel", shared=True, moe=True, layer_id
     )
 
 
-def _config(on=True, tp=4, pp=1, dp=1, ep=False, lora=None, mode=CUDAGraphMode.FULL):
+def _config(on=True, tp=4, pp=1, dp=1, ep=False, lora=None, mode=CUDAGraphMode.FULL,
+            max_len=262144):  # fmt: skip
     return NS(
         kernel_config=NS(monokernel=on),
-        model_config=NS(hf_text_config=NS(num_hidden_layers=60)),
+        model_config=NS(hf_text_config=NS(num_hidden_layers=60), max_model_len=max_len),
         parallel_config=NS(
             tensor_parallel_size=tp,
             pipeline_parallel_size=pp,
@@ -58,10 +65,10 @@ def test_supported_deployment_has_no_refusals(gfx942):
 
 def test_every_reason_is_reported(gfx942):
     why = mono.refusals(
-        _layer(backend="AITER", shared=False),
+        _layer(backend="AITER", shared=False, kv="auto", skip_topk=True),
         _config(tp=8, pp=2, dp=2, ep=True, lora=object(), mode=CUDAGraphMode.PIECEWISE),
     )
-    assert len(why) == 8, why
+    assert len(why) == 10, why
 
 
 def test_create(gfx942):
@@ -71,6 +78,8 @@ def test_create(gfx942):
     assert mono.MonoLayer.create(_layer(), _config()).max_tokens == 16
     with pytest.raises(ValueError, match="tensor parallel size 4"):
         mono.MonoLayer.create(_layer(), _config(tp=2))
+    with pytest.raises(ValueError, match="max_model_len"):
+        mono.MonoLayer.create(_layer(), _config(max_len=2**20))
 
 
 @pytest.mark.parametrize(
@@ -99,9 +108,9 @@ def test_decode_routing(monkeypatch, rows, mode, prefills, decodes, dec_tokens,
     )
     monkeypatch.setattr(mono, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(mono, "get_forward_context", lambda: fc)
-    assert (mono.MonoLayer(16)._decode(layer, rows) is md) is expect
+    assert (mono.MonoLayer(16, 64)._decode(layer, rows) is md) is expect
 
 
 def test_no_forward_context(monkeypatch):
     monkeypatch.setattr(mono, "is_forward_context_available", lambda: False)
-    assert mono.MonoLayer(16)._decode(_layer(), 1) is None
+    assert mono.MonoLayer(16, 64)._decode(_layer(), 1) is None

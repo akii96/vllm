@@ -85,12 +85,20 @@ def _hw_f32(name, x):
     )
 
 
+def hw_rsq(x):
+    return _hw_f32("llvm.amdgcn.rsq.f32", x)
+
+
 def hw_rcp(x):
     return _hw_f32("llvm.amdgcn.rcp.f32", x)
 
 
 def hw_exp2(x):
     return _hw_f32("llvm.amdgcn.exp2.f32", x)
+
+
+def hw_log2(x):
+    return _hw_f32("llvm.amdgcn.log.f32", x)
 
 
 def rsqrt_rn(x):
@@ -141,6 +149,7 @@ def butterfly(v, offsets, op=_add):
 
 
 WAVE = (32, 16, 8, 4, 2, 1)
+ROW16 = (8, 4, 2, 1)
 
 
 def wave_sum(v):
@@ -193,6 +202,25 @@ def mfma_fp8(a, b, c):
     return fx.Vector(
         rocdl.mfma_f32_16x16x32_fp8_fp8(T.vec(4, T.f32), [a, b, c, 0, 0, 0])
     )
+
+
+def mfma_bf16(a, b, c):
+    """16x16x16 bf16 MFMA (CDNA3+), a / b two Int32 words (4 bf16) a lane."""
+    av = fx.Vector.from_elements(a, fx.Int32).bitcast(fx.Int16)
+    bv = fx.Vector.from_elements(b, fx.Int32).bitcast(fx.Int16)
+    return fx.Vector(
+        rocdl.mfma_f32_16x16x16bf16_1k(T.vec(4, T.f32), [av, bv, c, 0, 0, 0])
+    )
+
+
+def fp8x4_bf16(word):
+    """One dword of four FP8 (the GPU's native flavour) -> two bf16-pair words,
+    exact: an FP8 value's f32 fits bf16."""
+    out = []
+    for hi in (False, True):
+        v = fx.Vector(rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), word, hi)).bitcast(fx.Int32)
+        out.append((v[1] & fx.Int32(-65536)) | fx.Int32(fx.Uint32(v[0]) >> 16))
+    return out
 
 
 @traced

@@ -1342,6 +1342,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mono is not None:
+            out = self.mono(self, positions, hidden_states, residual)
+            if out is not None:
+                return out
         # Self Attention
         if residual is None:
             residual = hidden_states

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Host side of the MiniMax-M3 FFN MonoKernel: one ``MonoFFN`` per TP rank runs
-every sparse layer's FFN launch (``ops.ffn``) of a decode step."""
+"""Host side of the MiniMax-M3 MonoKernels: one ``MonoAttn`` and one ``MonoFFN`` per
+TP rank run every sparse layer's attention and FFN launches (``ops``) of a
+decode step."""
 
 import hashlib
 import os
@@ -179,6 +180,183 @@ class MonoFFN:
 
     def close(self) -> None:
         self.peer.close()
+
+
+@dataclass(frozen=True)
+class AttnWeights:
+    """One sparse layer's attention tensors as vLLM holds them after loading."""
+
+    g_in: torch.Tensor  # [H] bf16
+    w_qkv: torch.Tensor  # [2560, H] fp8: q | k | v | index_q | index_k rows
+    s_qkv: torch.Tensor  # [2560(, 1)] f32
+    g_q: torch.Tensor  # [128] bf16
+    g_k: torch.Tensor
+    g_iq: torch.Tensor
+    g_ik: torch.Tensor
+    cos_sin: torch.Tensor  # [max_pos, 64] bf16: cos | sin
+    w_o: torch.Tensor  # [H, 2048] fp8
+    s_o: torch.Tensor  # [H(, 1)] f32
+    k_scale: torch.Tensor  # [1] f32
+    v_scale: torch.Tensor  # [1] f32
+    sm_scale: float
+    eps: float
+
+    def check(self) -> list[str]:
+        from vllm.models.minimax_m3.amd.mono.ops import attn as a
+
+        want = {
+            "g_in": ((a.H,), _BF16),
+            "w_qkv": ((a.QKV_ROWS, a.H), _FP8),
+            "s_qkv": ((a.QKV_ROWS,), _F32),
+            "g_q": ((a.HEAD_DIM,), _BF16),
+            "g_k": ((a.HEAD_DIM,), _BF16),
+            "g_iq": ((a.HEAD_DIM,), _BF16),
+            "g_ik": ((a.HEAD_DIM,), _BF16),
+            "w_o": ((a.H, a.O_K), _FP8),
+            "s_o": ((a.H,), _F32),
+            "k_scale": ((1,), _F32),
+            "v_scale": ((1,), _F32),
+        }
+        bad = _mismatches(self, want)
+        cs = self.cos_sin
+        if (
+            cs.dtype != torch.bfloat16
+            or cs.shape[-1] != a.ROTARY
+            or not cs.is_contiguous()
+        ):
+            bad.append(f"cos_sin: {tuple(cs.shape)} {cs.dtype}")
+        return bad
+
+    @classmethod
+    def from_layer(cls, layer) -> "AttnWeights":
+        """Views of a loaded ``MiniMaxM3DecoderLayer``'s attention tensors. FP8
+        linears hold their weight as a ``.t()`` view of [N, K] storage."""
+        a = layer.self_attn
+        one = torch.ones(1, dtype=torch.float32, device=a.qkv_proj.weight.device)
+        w = cls(
+            g_in=layer.input_layernorm.weight,
+            w_qkv=a.qkv_proj.weight.t(),
+            s_qkv=a.qkv_proj.weight_scale,
+            g_q=a.q_norm.weight,
+            g_k=a.k_norm.weight,
+            g_iq=a.index_q_norm.weight,
+            g_ik=a.index_k_norm.weight,
+            cos_sin=a.rotary_emb.cos_sin_cache,
+            w_o=a.o_proj.weight.t(),
+            s_o=a.o_proj.weight_scale,
+            k_scale=getattr(a, "_k_scale", one).float().reshape(1),
+            v_scale=getattr(a, "_v_scale", one).float().reshape(1),
+            sm_scale=a.scaling,
+            eps=a.q_norm.variance_epsilon,
+        )
+        return _checked(w, layer)
+
+    def ptrs(self) -> list[int]:
+        return [
+            getattr(self, n).data_ptr()
+            for n in (
+                "g_in",
+                "w_qkv",
+                "s_qkv",
+                "g_q",
+                "g_k",
+                "g_iq",
+                "g_ik",
+                "cos_sin",
+                "w_o",
+                "s_o",
+            )  # fmt: skip
+        ]
+
+
+class MonoAttn:
+    """The attention MonoKernel of one TP rank: no collectives (the FFN launch
+    reduces its output)."""
+
+    def __init__(self, device: torch.device, max_blocks: int, timeline: bool = False):
+        from vllm.models.minimax_m3.amd.mono.ops import attn as attn_ops
+
+        _ensure_writable_flydsl_cache()
+        self.ops = attn_ops
+        self.device, self.max_blocks, self.timeline = device, max_blocks, timeline
+        self.grid = torch.cuda.get_device_properties(device).multi_processor_count
+        self.scratch = torch.zeros(
+            attn_ops.SCRATCH_BYTES, dtype=torch.uint8, device=device
+        )
+        self.ctr = torch.zeros(self.grid, dtype=torch.int32, device=device)
+        self.tl = torch.zeros(
+            self.grid, attn_ops.STAMPS, dtype=torch.int64, device=device
+        )
+        self._key = _source_digest()
+        self._kernels: dict = {}
+
+    def kernel(self, tokens: int, q_len: int, w: AttnWeights, fp8_index: bool):
+        return _build_once(
+            self._kernels,
+            (tokens, q_len, fp8_index),
+            lambda: self.ops.build_attn(
+                tokens,
+                self.grid,
+                self._key,
+                q_len,
+                w.sm_scale,
+                w.eps,
+                self.max_blocks,
+                self.timeline,
+                fp8_index,
+            ),  # fmt: skip
+        )
+
+    def run(
+        self,
+        w: AttnWeights,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        positions: torch.Tensor,
+        slots: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_cache: torch.Tensor,
+        index_cache: torch.Tensor,
+        q_len: int = 1,
+        add_residual: bool = True,
+        partial: torch.Tensor | None = None,
+        res_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """-> (this rank's unreduced o_proj output, the new residual)."""
+        m = x.shape[0]
+        assert 1 <= m <= MAX_TOKENS and m % q_len == 0
+        assert positions.dtype == slots.dtype == torch.int64
+        assert block_table.dtype == seq_lens.dtype == torch.int32
+        assert block_table.stride(1) == 1 and kv_cache.stride(-1) == 1
+        assert kv_cache.element_size() == 1 and kv_cache.shape[-2:] == (128, 256), (
+            f"KV cache {tuple(kv_cache.shape)} {kv_cache.dtype}"
+        )
+        assert index_cache.dtype in (torch.bfloat16, current_fp8_dtype()), (
+            f"index cache {index_cache.dtype}"
+        )
+        partial = torch.empty_like(x) if partial is None else partial
+        res_out = torch.empty_like(x) if res_out is None else res_out
+        self.kernel(m, q_len, w, index_cache.dtype != torch.bfloat16)(
+            x.data_ptr(), residual.data_ptr(), res_out.data_ptr(), partial.data_ptr(),
+            *w.ptrs(),
+            kv_cache.data_ptr(), kv_cache.stride(0) * kv_cache.element_size(),
+            index_cache.data_ptr(), index_cache.stride(0) * index_cache.element_size(),
+            w.k_scale.data_ptr(), w.v_scale.data_ptr(),
+            positions.data_ptr(), slots.data_ptr(),
+            block_table.data_ptr(), block_table.stride(0), seq_lens.data_ptr(),
+            self.scratch.data_ptr(), self.ctr.data_ptr(), int(add_residual),
+            self.tl.data_ptr(),
+            stream=_stream(),
+        )  # fmt: skip
+        return partial, res_out
+
+
+def current_fp8_dtype() -> torch.dtype:
+    """The FP8 flavour the device converts natively (e4m3fnuz on gfx942)."""
+    from vllm.platforms import current_platform
+
+    return current_platform.fp8_dtype()
 
 
 def _checked(w, layer):

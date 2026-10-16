@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MiniMax-M3 FFN MonoKernel in the sparse decoder layers (``--monokernel``).
+"""MiniMax-M3 MonoKernels in the sparse decoder layers (``--monokernel``).
 
 A pure decode step of at most ``MAX_TOKENS`` rows (speculative verify included)
-runs each sparse layer's FFN half as one launch a rank: o_proj's all-reduce,
-the post-attention norm, router, routed and shared FP8 experts and the MoE
-all-reduce, after vLLM's attention. Every other step runs the layer unchanged.
-The decision reads only metadata every TP rank holds alike, since the kernels
-wait on each other's pushes.
+runs each sparse layer as two launches a rank: the attention launch (input
+norm, qkv, head norm / RoPE / cache inserts, indexer scores and top-k, sparse
+attention, o_proj) and the FFN launch (o_proj's all-reduce, post-attention norm,
+router, routed and shared FP8 experts, the MoE all-reduce). Every other step
+runs the layer unchanged. The decision reads only metadata every TP rank holds
+alike, since the kernels wait on each other's pushes.
 """
 
 import functools
@@ -23,11 +24,12 @@ from vllm.models.minimax_m3.common.sparse_attention import MiniMaxM3SparseMetada
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:  # the runtime imports FlyDSL, which only a --monokernel run needs
-    from .runtime import FFNWeights
+    from .runtime import AttnWeights, FFNWeights
 
 logger = init_logger(__name__)
 
 TP = 4
+SPARSE_BLOCK = 128
 
 
 def _strategy(obj, field: str = "weight_quant") -> str | None:
@@ -36,7 +38,7 @@ def _strategy(obj, field: str = "weight_quant") -> str | None:
 
 
 def refusals(layer, vllm_config) -> list[str]:
-    """Every reason the deployment cannot run this layer's MonoKernel."""
+    """Every reason the deployment cannot run this layer's MonoKernels."""
     pc = vllm_config.parallel_config
     mode = vllm_config.compilation_config.cudagraph_mode
     why = [
@@ -82,11 +84,16 @@ def refusals(layer, vllm_config) -> list[str]:
         for p in (sh.gate_up_proj, sh.down_proj)
     ):
         why.append("needs a per-channel FP8 shared expert")
+    attn = layer.self_attn
+    if getattr(attn, "use_aiter_sparse_pa", False) or attn.kv_cache_dtype != "fp8":
+        why.append("needs the Triton sparse attention with an fp8 KV cache")
+    if getattr(attn, "skip_index_topk", False):
+        why.append("no cross-layer index sharing (index_topk_freq)")
     return why
 
 
 @functools.cache
-def _runner(device: torch.device):
+def _runners(device: torch.device, max_blocks: int):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "--monokernel first reached inside CUDA graph capture, before an eager "
@@ -98,23 +105,25 @@ def _runner(device: torch.device):
         get_tp_group,
     )
 
-    from .runtime import MonoFFN
+    from .runtime import MonoAttn, MonoFFN
 
     logger.info("MiniMax-M3 MonoKernels active (decode steps)")
-    return MonoFFN(
+    ffn = MonoFFN(
         get_tensor_model_parallel_world_size(),
         get_tensor_model_parallel_rank(),
         get_tp_group().cpu_group,
         device,
     )
+    return MonoAttn(device, max_blocks), ffn
 
 
 class MonoLayer:
     """One sparse decoder layer's MonoKernel path."""
 
-    def __init__(self, max_tokens: int):
+    def __init__(self, max_tokens: int, max_blocks: int):
         self.max_tokens = max_tokens
-        self._w: FFNWeights | None = None
+        self.max_blocks = max_blocks
+        self._w: tuple[AttnWeights, FFNWeights] | None = None
 
     @classmethod
     def create(cls, layer, vllm_config) -> "MonoLayer | None":
@@ -128,17 +137,22 @@ class MonoLayer:
         ):
             return None
         why = refusals(layer, vllm_config)
+        max_blocks = -(-vllm_config.model_config.max_model_len // SPARSE_BLOCK)
         if not why:
             try:
+                from .ops.attn import MAX_BLOCKS
                 from .runtime import MAX_TOKENS
             except ImportError as err:
                 why.append(f"needs FlyDSL and AITER ({err})")
+            else:
+                if max_blocks > MAX_BLOCKS:
+                    why.append(f"max_model_len over {MAX_BLOCKS * SPARSE_BLOCK}")
         if why:
             raise ValueError("--monokernel for MiniMax-M3: " + "; ".join(why) + ".")
-        return cls(MAX_TOKENS)
+        return cls(MAX_TOKENS, max_blocks)
 
     def _decode(self, layer, rows: int) -> MiniMaxM3SparseMetadata | None:
-        """This step's metadata if it is one the kernel takes: a pure decode of
+        """This step's metadata if it is one the kernels take: a pure decode of
         at most ``max_tokens`` rows, eager or a full CUDA graph."""
         if not 1 <= rows <= self.max_tokens or not is_forward_context_available():
             return None
@@ -160,18 +174,50 @@ class MonoLayer:
             return None
         return m
 
+    def _weights(self, layer) -> "tuple[AttnWeights, FFNWeights]":
+        if self._w is None:
+            from .runtime import AttnWeights, FFNWeights
+
+            self._w = (AttnWeights.from_layer(layer), FFNWeights.from_layer(layer))
+        return self._w
+
+    def __call__(self, layer, positions, x, residual):
+        """The whole layer -> (reduced FFN output, new residual), or None: then
+        vLLM's attention runs and ``ffn`` follows. Speculative verify steps
+        (several query rows a request) take that route."""
+        m = self._decode(layer, x.shape[0])
+        if m is None or m.decode is None or m.decode.decode_query_len != 1:
+            return None
+        d = m.decode
+        attn_r, ffn_r = _runners(x.device, self.max_blocks)
+        attn_w, ffn_w = self._weights(layer)
+        attn = layer.self_attn
+        slots = get_forward_context().slot_mapping[attn.layer_name]
+        first = residual is None
+        partial, res = attn_r.run(
+            attn_w,
+            x,
+            x if first else residual,
+            positions,
+            slots[: x.shape[0]],
+            d.block_table,
+            d.seq_lens,
+            attn.kv_cache,
+            attn.indexer.index_cache.kv_cache,
+            q_len=d.decode_query_len,
+            add_residual=not first,
+        )
+        return ffn_r.run(ffn_w, partial, res, d.seq_lens, d.decode_query_len)
+
     def ffn(self, layer, partial, residual):
-        """(reduced FFN output, new residual) from vLLM's attention's unreduced
-        o_proj output, or None for vLLM's path."""
+        """After vLLM's attention: (reduced FFN output, new residual) from its
+        unreduced o_proj output, or None for vLLM's path."""
         m = self._decode(layer, partial.shape[0])
         if m is None:
             return None
-        if self._w is None:
-            from .runtime import FFNWeights
-
-            self._w = FFNWeights.from_layer(layer)
         d = m.decode
         assert d is not None  # _decode checked it
-        return _runner(partial.device).run(
-            self._w, partial, residual, d.seq_lens, d.decode_query_len
+        _, ffn_r = _runners(partial.device, self.max_blocks)
+        return ffn_r.run(
+            self._weights(layer)[1], partial, residual, d.seq_lens, d.decode_query_len
         )
