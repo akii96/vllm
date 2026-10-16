@@ -29,7 +29,7 @@ def worker(rank, m, layer):
     x = (torch.randn(m, H, device=dev, generator=g) * 0.3).bfloat16()
     res = (torch.randn(m, H, device=dev, generator=g) * 3).bfloat16()
     for _ in range(4):
-        mono.run(w, x, res)
+        mono.run(w, x, res, torch.ones(m, dtype=torch.int32, device=dev))
     torch.accelerator.synchronize()
     dist.barrier()
     mono.close()

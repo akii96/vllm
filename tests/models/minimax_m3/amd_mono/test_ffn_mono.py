@@ -222,7 +222,11 @@ def worker(rank, widths, port, result):
         w = load_weights(dev, rank, int(REAL_LAYER))
     mono = MonoFFN(TP, rank, dist.group.WORLD, dev)
     errs = {}
-    for m in widths:
+    for spec in widths:
+        # "m:n": m rows, the first n live (a CUDA-graph padded step); the
+        # padding rows' outputs are not checked
+        m, n = (int(v) for v in f"{spec}:{spec}".split(":")[:2])
+        live = (torch.arange(m, device=dev) < n).to(torch.int32)
         gen = torch.Generator(device=dev).manual_seed(7 + m)
         parts = [
             (torch.randn(m, H, device=dev, generator=gen) * 0.3).bfloat16()
@@ -239,11 +243,11 @@ def worker(rank, widths, port, result):
             dist.all_gather(shares, mine)
             ref_sum = trunc(sum(shares)).to(dev)
         for _ in range(3):
-            out, h_mid = mono.run(w, parts[rank], residual)
+            out, h_mid = mono.run(w, parts[rank], residual, live)
             torch.accelerator.synchronize()
         dist.barrier()
-        rel = ((out.float() - ref_sum.float()).norm() / ref_sum.float().norm()).item()
-        errs[m] = (rel, torch.equal(h_mid, h))
+        o, r = out[:n].float(), ref_sum[:n].float()
+        errs[spec] = (((o - r).norm() / r.norm()).item(), torch.equal(h_mid, h))
     if rank == 0:
         result.update(errs)
     mono.close()
@@ -261,7 +265,7 @@ def run(widths):
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < TP, reason="needs 4 GPUs")
-@pytest.mark.parametrize("widths", [[1, 4, 6, 8]])
+@pytest.mark.parametrize("widths", [["1", "4", "6", "8", "16", "16:10"]])
 def test_ffn_mono_matches_reference(widths):
     for m, (rel, res_ok) in run(widths).items():
         assert res_ok, f"width {m}: residual mismatch"
@@ -269,6 +273,6 @@ def test_ffn_mono_matches_reference(widths):
 
 
 if __name__ == "__main__":
-    ws = [int(a) for a in sys.argv[1:]] or [1, 4, 6, 8]
-    for m, (rel, ok) in sorted(run(ws).items()):
+    ws = sys.argv[1:] or ["1", "4", "6", "8", "16", "16:10"]
+    for m, (rel, ok) in run(ws).items():
         print(f"width {m}: rel={rel:.3e} residual_exact={ok}")

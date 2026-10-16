@@ -1,7 +1,7 @@
 # MiniMax-M3 FFN MonoKernel (ROCm, FlyDSL)
 
 `--monokernel` runs the FFN half of each sparse MoE layer (3..59) of a pure
-decode step of at most 8 rows, speculative verify included, as one persistent
+decode step of at most 16 rows, speculative verify included, as one persistent
 launch per TP rank (RFC vllm-project/vllm#60904), after vLLM's attention. Every
 other step runs the layer unchanged; both paths take and return the same
 tensors at the layer boundary, so they interleave freely.
@@ -17,7 +17,8 @@ the TP-reduced FFN output and the new residual:
 
 From 5 rows the MoE runs by distinct expert: each expert's weights are read
 once for every token routed to it (the gfx950 mono kernel's wide MoE,
-ROCm/aiter#6047).
+ROCm/aiter#6047). Rows of CUDA-graph padding requests are not run through the
+experts, so a padded step costs about its live rows.
 
 ## Scope
 

@@ -137,35 +137,41 @@ class MonoLayer:
             raise ValueError("--monokernel for MiniMax-M3: " + "; ".join(why) + ".")
         return cls(MAX_TOKENS)
 
-    def _is_decode(self, layer, rows: int) -> bool:
-        """Whether this step is one the kernel takes: a pure decode of at most
-        ``max_tokens`` rows, eager or a full CUDA graph."""
+    def _decode(self, layer, rows: int) -> MiniMaxM3SparseMetadata | None:
+        """This step's metadata if it is one the kernel takes: a pure decode of
+        at most ``max_tokens`` rows, eager or a full CUDA graph."""
         if not 1 <= rows <= self.max_tokens or not is_forward_context_available():
-            return False
+            return None
         fc = get_forward_context()
         md = fc.attn_metadata
         if fc.cudagraph_runtime_mode not in (
             CUDAGraphMode.NONE,
             CUDAGraphMode.FULL,
         ) or not isinstance(md, dict):
-            return False
+            return None
         m = md.get(layer.self_attn.layer_name)
-        if not isinstance(m, MiniMaxM3SparseMetadata):
-            return False
-        return not (
-            m.num_prefills != 0
+        if (
+            not isinstance(m, MiniMaxM3SparseMetadata)
+            or m.num_prefills != 0
             or m.num_decodes == 0
             or m.decode is None
             or m.num_decode_tokens != rows
-        )
+        ):
+            return None
+        return m
 
     def ffn(self, layer, partial, residual):
         """(reduced FFN output, new residual) from vLLM's attention's unreduced
         o_proj output, or None for vLLM's path."""
-        if not self._is_decode(layer, partial.shape[0]):
+        m = self._decode(layer, partial.shape[0])
+        if m is None:
             return None
         if self._w is None:
             from .runtime import FFNWeights
 
             self._w = FFNWeights.from_layer(layer)
-        return _runner(partial.device).run(self._w, partial, residual)
+        d = m.decode
+        assert d is not None  # _decode checked it
+        return _runner(partial.device).run(
+            self._w, partial, residual, d.seq_lens, d.decode_query_len
+        )

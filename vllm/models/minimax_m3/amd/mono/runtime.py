@@ -140,15 +140,22 @@ class MonoFFN:
         w: FFNWeights,
         partial: torch.Tensor,
         residual: torch.Tensor,
+        seq_lens: torch.Tensor,
+        q_len: int = 1,
         out: torch.Tensor | None = None,
         h_mid: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """-> (TP-reduced FFN output, new residual) of one sparse layer."""
+        """-> (TP-reduced FFN output, new residual) of one sparse layer.
+
+        ``seq_lens``: the step's per-request lengths, ``q_len`` rows a request;
+        a 0 marks a CUDA-graph padding request, whose rows' experts are skipped.
+        """
         m = partial.shape[0]
         assert (
             1 <= m <= MAX_TOKENS
             and partial.is_contiguous()
             and residual.is_contiguous()
+            and seq_lens.dtype == torch.int32
         )
         out = torch.empty_like(partial) if out is None else out
         h_mid = torch.empty_like(residual) if h_mid is None else h_mid
@@ -164,6 +171,8 @@ class MonoFFN:
             self.ctr.data_ptr(),
             self.rank,
             self.tl.data_ptr(),
+            seq_lens.data_ptr(),
+            q_len,
             stream=_stream(),
         )
         return out, h_mid

@@ -68,7 +68,7 @@ def test_create(gfx942):
     assert mono.MonoLayer.create(_layer(), _config(on=False)) is None
     assert mono.MonoLayer.create(_layer(moe=False), _config()) is None
     assert mono.MonoLayer.create(_layer(layer_id=60), _config()) is None
-    assert mono.MonoLayer.create(_layer(), _config()).max_tokens == 8
+    assert mono.MonoLayer.create(_layer(), _config()).max_tokens == 16
     with pytest.raises(ValueError, match="tensor parallel size 4"):
         mono.MonoLayer.create(_layer(), _config(tp=2))
 
@@ -78,7 +78,7 @@ def test_create(gfx942):
     [
         (4, CUDAGraphMode.FULL, 0, 4, 4, True, True),
         (8, CUDAGraphMode.NONE, 0, 2, 8, True, True),  # spec verify: 4 tokens a request
-        (9, CUDAGraphMode.FULL, 0, 9, 9, True, False),  # past the 8-row cap
+        (17, CUDAGraphMode.FULL, 0, 17, 17, True, False),  # past the 16-row cap
         (4, CUDAGraphMode.PIECEWISE, 0, 4, 4, True, False),
         (4, CUDAGraphMode.NONE, 1, 3, 3, True, False),
         (4, CUDAGraphMode.NONE, 0, 0, 0, True, False),
@@ -99,9 +99,9 @@ def test_decode_routing(monkeypatch, rows, mode, prefills, decodes, dec_tokens,
     )
     monkeypatch.setattr(mono, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(mono, "get_forward_context", lambda: fc)
-    assert mono.MonoLayer(8)._is_decode(layer, rows) is expect
+    assert (mono.MonoLayer(16)._decode(layer, rows) is md) is expect
 
 
 def test_no_forward_context(monkeypatch):
     monkeypatch.setattr(mono, "is_forward_context_available", lambda: False)
-    assert mono.MonoLayer(8)._is_decode(_layer(), 1) is False
+    assert mono.MonoLayer(16)._decode(_layer(), 1) is None

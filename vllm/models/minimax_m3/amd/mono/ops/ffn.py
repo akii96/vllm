@@ -24,7 +24,10 @@ expert for every token, B read from xq staged in LDS; a down task is one
 (token, 32 rows) over its 5 units. Wide (M >= WIDE_FROM): a ug task is one
 distinct routed expert (or the shared one) for every token at once, B (column =
 token) held in VGPRs; a down task is 32 rows over every distinct expert, with
-all mids staged in LDS.
+the mids staged in LDS (in two k-halves past 8 rows).
+
+Rows of CUDA-graph padding requests (``seq_lens`` 0) are routed but their
+experts are not run: a padded step costs about its live rows.
 
 Hand-offs are (value, tag) pairs; the tag is a per-CTA launch counter, equal on
 every CTA and rank since every launch bumps it once.
@@ -70,7 +73,7 @@ from vllm.models.common.mono.device import (
 
 THREADS = 512
 WAVES = THREADS // 64
-MAX_TOKENS = 8
+MAX_TOKENS = 16
 H = 6144
 # expert intermediate size per rank (TP4)
 I = 768  # noqa: E741
@@ -146,9 +149,14 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
         assert DN_TASKS + Q_TASKS <= G
     DN_ITERS = -(-DN_TASKS // G)
     MID_ROWS = M * UNITS
-    MID_ROW = I // 4 + 4  # words, padded 16 B
+    # Wide down: past 8 rows the mids do not fit LDS, so they are staged in two
+    # k-halves; each expert's accumulator stays in VGPRs across the passes, so
+    # its weights are still read once.
+    NPASS = 1 if M <= 8 else 2
+    MID_ROW = I // (4 * NPASS) + 4  # words a staged row, padded 16 B
     assert MID_ROWS * DN_ROWS <= 2 * WAVES * 256 or not WIDE
     DN_LD = I // 64  # 16 B loads a lane, an expert's 16 rows: 12
+    KC_P = DN_LD // NPASS  # those a pass
     DN_EXP = -(-(U_MAX + 1) // DN_KW)  # experts a wave runs, at most
     PUSH_THREADS = M * H // 4  # 4 bf16 a thread
 
@@ -196,6 +204,8 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
         ctr: Int64,
         rank: Int32,
         tl: Int64,
+        seq_lens: Int64,
+        q_len: Int32,
     ):
         _ = key
 
@@ -221,6 +231,12 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
         sig, rexp, rwt = lds.sig.ptr, lds.rexp.ptr, lds.rwt.ptr
         msc, part, sm, xsc = lds.msc.ptr, lds.part.ptr, lds.sm.ptr, lds.xsc.ptr
         uexp, umask, midl = lds.uexp.ptr, lds.umask.ptr, lds.mid.ptr
+
+        # rows from m_live on belong to CUDA-graph padding requests (seq_len 0):
+        # wave 0, a request a lane, counts the live ones
+        n_req = M // q_len  # requests (seq_lens entries) of the step
+        r_ok = (lane < n_req) & (load_i32(seq_lens, fx.min(lane, n_req - 1)) > 0)
+        m_live = uniform(fx.min(popcount(ballot(r_ok)) * q_len, M))
 
         tag = uniform(load_i32(ctr, bid)) + 1
         mb = Mailbox(tag)
@@ -480,7 +496,7 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
             m = fx.Int32(0)
             if tid < E:
                 for p in range_constexpr(M * TOP_K):
-                    hit = fx.ptr_load(rexp + p) == tid
+                    hit = (fx.ptr_load(rexp + p) == tid) & (p // TOP_K < m_live)
                     m = m | hit.select(fx.Int32(1 << (p // TOP_K)), fx.Int32(0))
             bal = ballot(m != 0)
             below = popcount(bal & ((fx.Int64(1) << fx.Int64(lane)) - 1))
@@ -659,7 +675,10 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
             """(token, unit) row q's mids -> FP8 in mq, its scale published to mqs;
             done once here rather than in every down task."""
             v4 = [fx.Float32(0.0) for _ in range(4)]
-            if tid < I // 4:
+            # a padding row's routed mids are never written (its experts are
+            # skipped): it quantizes zeros; its shared mids are computed as usual
+            routed_pad = (q // UNITS >= m_live) & (q % UNITS != TOP_K)
+            if (tid < I // 4) & ~routed_pad:
                 got = mb_poll(
                     [(sreg("mids"), q * I + 4 * tid + 2 * h, 2) for h in range(2)]
                 )
@@ -730,8 +749,15 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
         # takes rows 16 * (w // 4).. and experts w % 4, w % 4 + 4, ..; B column
         # l16 is token l16's mid row. Per-(token, slot) terms are summed in slot
         # order, as vLLM does.
-        WD_UNIT = DN_LD + 1  # loads an expert: its s2 rows, then 12 weight words
-        WD_DEPTH = 3 * WD_UNIT  # loads in flight
+        # Load order: per pass, per expert, its KC_P weight words; the s2 rows
+        # follow in the last pass, where they are read.
+        WD_SCHED = [
+            (p, i, c)
+            for p in range(NPASS)
+            for i in range(DN_EXP)
+            for c in range(KC_P + (p == NPASS - 1))
+        ]
+        WD_DEPTH = (3 if NPASS == 1 else 2) * (DN_LD + 1)  # loads in flight
 
         def wd_unit(i):
             """(distinct index, live, shared, expert) of this wave's i-th expert;
@@ -744,11 +770,11 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
             return du, du <= nu, du == nu, ex
 
         def wd_load(dg, n, has):
-            du, ok, sh, ex = wd_unit(n // WD_UNIT)
+            p, i, c = WD_SCHED[n]
+            du, ok, sh, ex = wd_unit(i)
             ok = ok & has
-            c = n % WD_UNIT
             r0 = dg * DN_ROWS + (wave // DN_KW) * 16
-            if const_expr(c == 0):
+            if const_expr(c == KC_P):
                 base = sh.select(sdn_s, s2 + fx.Int64(ex) * (H * 4))
                 return load(
                     base,
@@ -760,7 +786,7 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
             base = sh.select(sdn, w2 + fx.Int64(ex) * W2_BYTES)
             return load(
                 base,
-                ((r0 + l16) * I + wd_k(c - 1)) // 4,
+                ((r0 + l16) * I + wd_k(p * KC_P + c)) // 4,
                 4,
                 nbytes=ok.select(fx.Int32(W2_BYTES), fx.Int32(0)),
             )
@@ -770,24 +796,36 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
             return (c // 2) * 128 + g4 * 32 + (c % 2) * 16
 
         def dn_load_wide(t, has):
-            return [wd_load(t, n, has) for n in range(min(WD_DEPTH, DN_EXP * WD_UNIT))]
+            return [wd_load(t, n, has) for n in range(min(WD_DEPTH, len(WD_SCHED)))]
 
         @traced
-        def stage_mids():
-            """Wide path: every (token, unit)'s FP8 mid row -> LDS, scales -> msc."""
-            if wave == 0:
-                got = mb_poll([(sreg("mqs"), fx.min(lane, MID_ROWS - 1), 1)])
-                if lane < MID_ROWS:
-                    fx.ptr_store(got[0][0].bitcast(fx.Float32), msc + lane)
-            gpu.barrier()
-            nv = MID_ROWS * (I // 16)
-            for p in range_constexpr(-(-nv // THREADS)):
-                v = tid + p * THREADS
-                if v < nv:
-                    w = load(sreg("mq"), v * 4, 4, cm=CM_DEV)
-                    fx.ptr_store(
-                        w, midl + (v // (I // 16) * MID_ROW + v % (I // 16) * 4)
+        def stage_mids(p):
+            """Wide path: k-slice p of every (token, unit)'s FP8 mid row -> LDS;
+            on the first pass the row scales -> msc."""
+            if const_expr(p == 0):  # noqa: SIM102 (a build-time and a run-time test)
+                if wave == 0:
+                    nq = -(-MID_ROWS // 64)
+                    got = mb_poll(
+                        [
+                            (sreg("mqs"), fx.min(lane + 64 * q, MID_ROWS - 1), 1)
+                            for q in range(nq)
+                        ]
                     )
+                    for q in range_constexpr(nq):
+                        if lane + 64 * q < MID_ROWS:
+                            fx.ptr_store(
+                                got[q][0].bitcast(fx.Float32), msc + (lane + 64 * q)
+                            )
+            gpu.barrier()  # also: the previous pass's B reads are done
+            ch = I // (16 * NPASS)  # 16 B chunks of a row's slice
+            nv = MID_ROWS * ch
+            for s in range_constexpr(-(-nv // THREADS)):
+                v = tid + s * THREADS
+                if v < nv:
+                    row = v // ch
+                    src = row * (I // 4) + p * (I // (4 * NPASS)) + v % ch * 4
+                    w = load(sreg("mq"), src, 4, cm=CM_DEV)
+                    fx.ptr_store(w, midl + (row * MID_ROW + v % ch * 4))
             gpu.barrier()
 
         @traced
@@ -795,44 +833,47 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
             inflight = list(wts)
             nxt = len(inflight)
             ok_all = fx.Int32(dg) < DN_TASKS
-            stage_mids()
             rg = wave // DN_KW
             kk = fx.min(l16, M - 1)
             v4 = fx.Vector.make_type(4, fx.Int32)
-            for i in range_constexpr(DN_EXP):
-                ld = []
-                for _ in range_constexpr(WD_UNIT):
-                    ld.append(inflight.pop(0))
-                    if const_expr(nxt < DN_EXP * WD_UNIT):
-                        inflight.append(wd_load(dg, nxt, ok_all))
-                        nxt += 1
-                du, ok, sh, ex = wd_unit(i)
-                um = fx.ptr_load(umask + fx.min(du, U_MAX - 1))
-                slot = sh.select(fx.Int32(TOP_K), slot_of(kk, ex))
-                mrow = kk * UNITS + slot
-                acc = fx.Vector.filled(4, 0.0, fx.Float32)
-                for c in range_constexpr(DN_LD):
-                    b = fx.Vector(
-                        fx.ptr_load(
-                            midl + (mrow * MID_ROW + wd_k(c) // 4), result_type=v4
+            accs = [None] * DN_EXP
+            for p in range_constexpr(NPASS):
+                stage_mids(p)
+                last = p == NPASS - 1
+                for i in range_constexpr(DN_EXP):
+                    ld = []
+                    for _ in range_constexpr(KC_P + last):
+                        ld.append(inflight.pop(0))
+                        if const_expr(nxt < len(WD_SCHED)):
+                            inflight.append(wd_load(dg, nxt, ok_all))
+                            nxt += 1
+                    du, ok, sh, ex = wd_unit(i)
+                    slot = sh.select(fx.Int32(TOP_K), slot_of(kk, ex))
+                    mrow = kk * UNITS + slot
+                    acc = fx.Vector.filled(4, 0.0, fx.Float32) if p == 0 else accs[i]
+                    for c in range_constexpr(KC_P):
+                        k0 = wd_k(p * KC_P + c) - p * (I // NPASS)
+                        b_at = midl + (mrow * MID_ROW + k0 // 4)
+                        b = fx.Vector(fx.ptr_load(b_at, result_type=v4))
+                        a = ld[c].bitcast(fx.Int64)
+                        b = b.bitcast(fx.Int64)
+                        for h in range_constexpr(2):
+                            acc = mfma_fp8(a[h], b[h], acc)
+                    accs[i] = acc
+                    if const_expr(last):
+                        um = fx.ptr_load(umask + fx.min(du, U_MAX - 1))
+                        ms = fx.ptr_load(msc + mrow)
+                        wgt = sh.select(
+                            fx.Float32(1.0),
+                            fx.ptr_load(rwt + (kk * TOP_K + fx.min(slot, TOP_K - 1))),
                         )
-                    )
-                    a = ld[c + 1].bitcast(fx.Int64)
-                    b = b.bitcast(fx.Int64)
-                    for h in range_constexpr(2):
-                        acc = mfma_fp8(a[h], b[h], acc)
-                ms = fx.ptr_load(msc + mrow)
-                wgt = sh.select(
-                    fx.Float32(1.0),
-                    fx.ptr_load(rwt + (kk * TOP_K + fx.min(slot, TOP_K - 1))),
-                )
-                live = ok & (l16 < M) & (sh | (((um >> kk) & 1) != 0))
-                if live:
-                    for j in range_constexpr(4):
-                        term = bf16_round(acc[j] * ms * ld[0][j] * wgt)
-                        fx.ptr_store(
-                            term, red + (mrow * DN_ROWS + rg * 16 + 4 * g4 + j)
-                        )
+                        live = ok & (l16 < M) & (sh | (((um >> kk) & 1) != 0))
+                        if live:
+                            for j in range_constexpr(4):
+                                term = bf16_round(acc[j] * ms * ld[KC_P][j] * wgt)
+                                fx.ptr_store(
+                                    term, red + (mrow * DN_ROWS + rg * 16 + 4 * g4 + j)
+                                )
             gpu.barrier()
             if tid < M * DN_ROWS:
                 k = tid // DN_ROWS
@@ -988,12 +1029,13 @@ def build_ffn(tokens: int, grid: int, tp: int, key: str, timeline: bool = False)
         gate: Int64, bias: Int64, w13: Int64, s13: Int64, w2: Int64, s2: Int64,
         sgu: Int64, sgu_s: Int64, sdn: Int64, sdn_s: Int64, scratch: Int64,
         peer_local: Int64, peers: Int64, ctr: Int64, rank: Int32, tl: Int64,
-        stream: fx.Stream = _STREAM,
+        seq_lens: Int64, q_len: Int32, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = key
         ffn_kernel(
             partial, residual, h_mid, out, g_post, gate, bias, w13, s13, w2, s2,
             sgu, sgu_s, sdn, sdn_s, scratch, peer_local, peers, ctr, rank, tl,
+            seq_lens, q_len,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)  # fmt: skip
 
     return launch

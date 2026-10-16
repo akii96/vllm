@@ -45,9 +45,10 @@ def worker(rank, widths, port):
         g = torch.Generator(device=dev).manual_seed(m)
         x = (torch.randn(m, H, device=dev, generator=g) * 0.3).bfloat16()
         res = (torch.randn(m, H, device=dev, generator=g) * 3).bfloat16()
+        live = torch.ones(m, dtype=torch.int32, device=dev)
         for it in range(6):
             mono.tl.zero_()
-            mono.run(ws[it % len(ws)], x, res)
+            mono.run(ws[it % len(ws)], x, res, live)
         torch.accelerator.synchronize()
         dist.barrier()
         if rank == 0:
