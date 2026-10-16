@@ -77,7 +77,7 @@ O_K = NQ * HEAD_DIM
 BLK = 128  # sparse block == KV page
 TOPK = 16
 SPLITS = TOPK  # attend tasks a token: one selected block each
-SCORE_BLOCKS = 8  # index blocks a score task: one a wave
+SCORE_BLOCKS = WAVES  # index blocks a score task: one a wave
 O_ROWS = 16
 FP8_MAX = 224.0  # vLLM's dynamic range on fnuz (the fp8 index cache)
 # qkv_proj / o_proj input quant: AITER's per-token quant (QuantFP8 on ROCm), the
@@ -395,10 +395,32 @@ def build_attn(
             gpu.barrier()
 
         # ------------------------------------------------------------ score
+        ROW_BYTES = HEAD_DIM * (1 if fp8_index else 2)
+        KW = BLK // 16 * (ROW_BYTES // 64)  # 16 B loads a lane, a block
+
+        def fresh_block(t):
+            """This wave's block of score task t holds a key this launch inserts."""
+            return (t // R * SCORE_BLOCKS + wave + 1) * BLK > load_i32(seq_lens, t % R) - q_len
+
+        def score_keys(t, has):
+            """This wave's block of score task t: its keys, 16 B a lane, all in
+            flight at once (zeros unless has)."""
+            r = t % R
+            b = t // R * SCORE_BLOCKS + wave
+            rlen = load_i32(seq_lens, r)
+            nblk = (rlen + BLK - 1) // BLK
+            on = has & (b < nblk)
+            pg = load_i32(block_table, r * bt_stride + fx.max(fx.min(b, nblk - 1), 0))
+            page = index_cache + fx.Int64(pg) * ix_stride
+            nbytes = on.select(fx.Int32(BLK * ROW_BYTES), fx.Int32(0))
+            return [load(page, ((sub * 16 + l16) * ROW_BYTES + kk * 64 + g4 * 16) // 4, 4, cm=CM_DEV, nbytes=nbytes)
+                    for sub in range(BLK // 16) for kk in range(ROW_BYTES // 64)]  # fmt: skip
+
         @traced
-        def score(t):
-            """Request r, index blocks c * SCORE_BLOCKS ..: wave w scores blocks
-            w, w + 8 against every row of the request (B column l16 = row)."""
+        def score(t, kws):
+            """Request r, index blocks c * SCORE_BLOCKS ..: wave w scores block w
+            (keys kws, ``score_keys``) against every row of the request (B
+            column l16 = row)."""
             r = t % R
             c = t // R
             rlen = load_i32(seq_lens, r)
@@ -414,37 +436,29 @@ def build_attn(
             else:
                 qw = [load(sreg("iq"), (qrow_ + kk * 32 + g4 * 8) // 2, 4, cm=CM_DEV)
                       for kk in range(HEAD_DIM // 32)]  # fmt: skip
-            row_bytes = HEAD_DIM * (1 if fp8_index else 2)
-            for i in range_constexpr(SCORE_BLOCKS // WAVES):
-                b = c * SCORE_BLOCKS + wave + i * WAVES
-                if b < nblk:
-                    page = index_cache + fx.Int64(load_i32(block_table, r * bt_stride + b)) * ix_stride
-                    # the block's keys in flight at once, 16 B a load
-                    kws = [
-                        [load(page, ((sub * 16 + l16) * row_bytes + kk * 64 + g4 * 16) // 4, 4, cm=CM_DEV)
-                         for kk in range(row_bytes // 64)]
-                        for sub in range(BLK // 16)
-                    ]  # fmt: skip
-                    mx = fx.Float32(NEG)
-                    for sub in range_constexpr(BLK // 16):
-                        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-                        for kk in range_constexpr(len(qw)):
-                            kv4 = kws[sub][kk]
-                            if const_expr(fp8_index):
-                                k8 = kv4.bitcast(fx.Int64)
-                                for h in range_constexpr(2):
-                                    acc = mfma_fp8(k8[h], qw[kk][h], acc)
-                            else:
-                                for h in range_constexpr(2):
-                                    acc = mfma_bf16([kv4[2 * h], kv4[2 * h + 1]], [qw[kk][2 * h], qw[kk][2 * h + 1]], acc)
-                        for e in range_constexpr(4):
-                            kpos = b * BLK + sub * 16 + 4 * g4 + e
-                            mx = fx.max(mx, (kpos < lim).select(acc[e], fx.Float32(NEG)))
-                    mx = butterfly(mx, (16, 32), fx.max)
-                    nb_q = (rlen - (q_len - 1 - fx.min(lane, q_len - 1)) + BLK - 1) // BLK
-                    sc_out = (b < nb_q).select((b == nb_q - 1).select(fx.Float32(1e29), mx), fx.Float32(-1e30))
-                    if lane < q_len:
-                        mb_put(sreg("score"), (r * q_len + lane) * MAX_BLOCKS + b, [sc_out.bitcast(fx.Int32)])
+            nk = len(qw)
+            b = c * SCORE_BLOCKS + wave
+            if b < nblk:
+                mx = fx.Float32(NEG)
+                for sub in range_constexpr(BLK // 16):
+                    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for kk in range_constexpr(nk):
+                        kv4 = kws[sub * nk + kk]
+                        if const_expr(fp8_index):
+                            k8 = kv4.bitcast(fx.Int64)
+                            for h in range_constexpr(2):
+                                acc = mfma_fp8(k8[h], qw[kk][h], acc)
+                        else:
+                            for h in range_constexpr(2):
+                                acc = mfma_bf16([kv4[2 * h], kv4[2 * h + 1]], [qw[kk][2 * h], qw[kk][2 * h + 1]], acc)
+                    for e in range_constexpr(4):
+                        kpos = b * BLK + sub * 16 + 4 * g4 + e
+                        mx = fx.max(mx, (kpos < lim).select(acc[e], fx.Float32(NEG)))
+                mx = butterfly(mx, (16, 32), fx.max)
+                nb_q = (rlen - (q_len - 1 - fx.min(lane, q_len - 1)) + BLK - 1) // BLK
+                sc_out = (b < nb_q).select((b == nb_q - 1).select(fx.Float32(1e29), mx), fx.Float32(-1e30))
+                if lane < q_len:
+                    mb_put(sreg("score"), (r * q_len + lane) * MAX_BLOCKS + b, [sc_out.bitcast(fx.Int32)])
 
         def max_len_blocks():
             """The longest request's index blocks (uniform)."""
@@ -453,10 +467,21 @@ def build_attn(
                 mx = fx.max(mx, load_i32(seq_lens, r))
             return (mx + BLK - 1) // BLK
 
+        def pack(vs):
+            return fx.Vector.from_elements([v[i] for v in vs for i in range(4)], fx.Int32)
+
+        def unpack(p):
+            return [fx.Vector.from_elements([p[4 * j + i] for i in range(4)], fx.Int32) for j in range(KW)]
+
         @traced
-        def score_loop(t0, n_live):
+        def score_loop(t0, n_live, kw0):
+            """Score tasks t0, t0 + G .. below n_live; a task's keys load during
+            the previous one (kw0: the first's, packed)."""
+            kw = kw0
             for t in range(t0, n_live, G):
-                score(t)
+                nxt = pack(score_keys(t + G, t + G < n_live))
+                score(t, unpack(kw))
+                kw = nxt
 
         # ------------------------------------------------------------ select
         def beats(ah, al, bh, bl):
@@ -708,13 +733,19 @@ def build_attn(
         if first("head") < HEAD_TASKS:
             head_task(first("head"))
         sc0 = first("score")
-        if sc0 < SCORE_TASKS:
-            wait_heads()
-            stamp(3)
         # only chunks below the longest request's length hold blocks: a CTA's
         # task stride stays G, the loop stops at the live task count
         live_chunks = (max_len_blocks() + SCORE_BLOCKS - 1) // SCORE_BLOCKS
-        score_loop(sc0, fx.min(live_chunks * R, fx.Int32(SCORE_TASKS)))
+        n_score = fx.min(live_chunks * R, fx.Int32(SCORE_TASKS))
+        # the first task's keys load while the heads finish; a block holding a
+        # key this launch inserts is read again after
+        kw0 = score_keys(sc0, sc0 < n_score)
+        if sc0 < SCORE_TASKS:
+            wait_heads()
+            stamp(3)
+        fresh = fresh_block(sc0)
+        kw1 = score_keys(sc0, (sc0 < n_score) & fresh)
+        score_loop(sc0, n_score, fresh.select(pack(kw1), pack(kw0)))
         if sc0 < SCORE_TASKS:
             stamp(2)
         at0 = first("attend")
