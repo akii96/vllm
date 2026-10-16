@@ -13,10 +13,12 @@ Stages, each a task table over the grid (a task waits only on earlier ones)::
     qkv     16 rows of q | k | v | index_q | index_k: FP8 GEMV, every token
     head    (token, head slot) a half wave: Gemma head norm, partial NeoX RoPE;
             q / index_q kept, K | V -> fp8 cache, index_k -> index cache
-    score   (request, 16 index blocks): bf16 MFMA of each row's index_q with
+    score   (request, 8 index blocks): bf16 MFMA of each row's index_q with
             the blocks' keys, block max; a row's newest block forced first
-    select  token: the 16 best blocks (ties to the lower block)
-    attend  (token, 4 selected blocks): 16 heads, K / V dequantized to bf16,
+    attend  (token, split s): selects the token's 16 best blocks (ties to the
+            lower block: split s ranks a 16th of them and publishes its 16
+            best, every split ranks the splits' candidates), then
+            the s-th selected block: 16 heads, K / V dequantized to bf16,
             bf16 MFMA, online softmax in base 2 -> partial O and log-sum-exp
     oproj   16 o_proj rows: merge every token's partials, per-token FP8 of the
             attention output, FP8 GEMV -> bf16 partial out
@@ -30,10 +32,9 @@ from flydsl.expr.typing import Int32, Int64
 
 from vllm.models.common.mono.device import (
     CM_DEV,
+    ROW16,
     WAVE,
     Mailbox,
-    ballot,
-    popcount,
     bf16_round,
     bf16_word,
     bf_hi,
@@ -75,8 +76,7 @@ QKV_ROWS = SLOTS * HEAD_DIM
 O_K = NQ * HEAD_DIM
 BLK = 128  # sparse block == KV page
 TOPK = 16
-SPLITS = 16  # attend tasks a token: one selected block each
-PER_SPLIT = TOPK // SPLITS
+SPLITS = TOPK  # attend tasks a token: one selected block each
 SCORE_BLOCKS = 8  # index blocks a score task: one a wave
 O_ROWS = 16
 FP8_MAX = 224.0  # vLLM's dynamic range on fnuz (the fp8 index cache)
@@ -91,7 +91,8 @@ MAX_BLOCKS = 2048  # index blocks a request at most (256K context)
 QKV_KC = H // 64 // WAVES  # 16 B weight loads a lane, a row group
 O_KC = O_K // 64 // WAVES
 KK = HEAD_DIM // 16  # 16-dim chunks of a head (bf16 MFMA k)
-STAMPS = 8
+STAMPS = 12
+KEY_NONE = -(2**31)  # a candidate pad's key: below every block's
 
 
 def _layout(items):
@@ -112,7 +113,7 @@ SCRATCH, SCRATCH_BYTES = _layout(
         ("q", MAX_TOKENS * O_K * 2),
         ("iq", MAX_TOKENS * HEAD_DIM * 2),
         ("score", MAX_TOKENS * MAX_BLOCKS * _P),
-        ("sel", MAX_TOKENS * TOPK * _P),
+        ("cand", MAX_TOKENS * SPLITS * TOPK * 2 * _P),  # (key, block) a split's best
         ("po", MAX_TOKENS * SPLITS * O_K * _P),
         ("plse", MAX_TOKENS * SPLITS * NQ * _P),
         ("ao", MAX_TOKENS * O_K),
@@ -145,7 +146,7 @@ def build_attn(
     ATT_TASKS = M * SPLITS
     O_TASKS = H // O_ROWS
     counts = (("norm", M), ("qkv", QKV_TASKS), ("head", HEAD_TASKS),
-              ("score", SCORE_TASKS), ("select", M), ("attend", ATT_TASKS),
+              ("score", SCORE_TASKS), ("attend", ATT_TASKS),
               ("merge", M))  # fmt: skip
     BASE, off = {}, 0
     for stage, n in counts:
@@ -155,12 +156,17 @@ def build_attn(
     BASE["oproj"] = (BASE["merge"] + M) % G
     ITERS = {s: -(-N[s] // G) for s in N}
     SCALE_LOG2 = sm_scale * LOG2E
-    SEL_PASSES = -(-max_blocks // THREADS)
+    # a split ranks a SPLITS-th of a token's blocks (pads up to CAP), then the
+    # splits' TOPK best each
+    CAP = max(2 * TOPK, 1 << (-(-max_blocks // SPLITS) - 1).bit_length())
+    CANDS = SPLITS * TOPK
+    PAD = MAX_BLOCKS  # pad pairs' block ids: above every block's
+    assert CAP <= THREADS and CANDS <= THREADS
 
     @fx.struct
     class Smem:
         red: fx.Array[fx.Float32, WAVES * 256, 16]
-        keys: fx.Array[fx.Int32, SEL_PASSES * THREADS, 16]
+        keys: fx.Array[fx.Int32, 2 * THREADS, 16]  # (key, block) pairs
         vt: fx.Array[fx.Int32, HEAD_DIM * BLK // 2, 16]  # V^T of a block: bf16 pairs
         pt: fx.Array[fx.Int32, NQ * BLK // 2, 16]  # P of a block: bf16 pairs
         hm: fx.Array[fx.Float32, 4 * NQ, 16]  # running max, running sum, alpha
@@ -453,181 +459,172 @@ def build_attn(
                 score(t)
 
         # ------------------------------------------------------------ select
-        MIN32 = -(2**31)
-        DIGITS = 16  # 4-bit radix
-        CNT = 0  # keys[]: two count buffers of WAVES x DIGITS, then the slot tables
-        GT_CNT = 2 * WAVES * DIGITS
-        EQ_CNT = GT_CNT + SEL_PASSES * WAVES
-        GT_PRE = EQ_CNT + SEL_PASSES * WAVES
-        EQ_PRE = GT_PRE + SEL_PASSES * WAVES
-        TOTALS = EQ_PRE + SEL_PASSES * WAVES
+        def beats(ah, al, bh, bl):
+            """(key, block) a orders before b: the higher key, ties to the lower block."""
+            return (ah > bh) | ((ah == bh) & (al < bl))
 
-        def i32(v: int) -> int:
-            return v - (1 << 32) if v >= 1 << 31 else v
-
-        @traced
-        def sel_prefix():
-            """Thread 0: exclusive prefix of the per-(pass, wave) counts, i.e. in
-            block order, and the total above the threshold."""
-            g = fx.Int32(0)
-            e = fx.Int32(0)
-            for i in range_constexpr(SEL_PASSES * WAVES):
-                fx.ptr_store(g, keys + (GT_PRE + i))
-                fx.ptr_store(e, keys + (EQ_PRE + i))
-                g = g + fx.ptr_load(keys + (GT_CNT + i))
-                e = e + fx.ptr_load(keys + (EQ_CNT + i))
-            fx.ptr_store(g, keys + TOTALS)
-
-        def cta_count(pred_of, buf, d):
-            """Lane 0 of each wave stores its count of pred over this thread's
-            keys at keys[buf + wave * DIGITS + d]."""
-            c = popcount(ballot(pred_of(0)))
-            for p in range_constexpr(1, SEL_PASSES):
-                c = c + popcount(ballot(pred_of(p)))
-            if lane == 0:
-                fx.ptr_store(c, keys + (buf + wave * DIGITS + d))
+        def rank_of(n):
+            """Key tid // P of the n keys in keys (in block order) and its rank, the
+            count of keys that beat it (ties to the lower index); P = THREADS // n
+            threads share a key. -> (index, rank, reports: this thread speaks)."""
+            P = THREADS // n
+            c = tid // P
+            part = tid % P
+            kc = fx.ptr_load(keys + c)
+            n_up = fx.Int32(0)
+            for j0 in range_constexpr(0, n, P):
+                j = part + j0
+                up = beats(fx.ptr_load(keys + j), j, kc, c)
+                n_up = n_up + up.select(fx.Int32(1), fx.Int32(0))
+            n_up = butterfly(n_up, tuple(P >> i for i in range(1, P.bit_length())))
+            return c, n_up, part == 0
 
         @traced
-        def select(k):
-            """Token k's best TOPK blocks -> sel (block ids in block order, then
-            the ties at the threshold, -1 pad). The TOPK-th largest key is found
-            by a 4-bit radix descent (8 passes, one barrier each, counts by
-            ballot); every block above it is taken, then the lowest-numbered
-            blocks at it -- vLLM's order (score, then lower block)."""
+        def nth_cand(s):
+            """The s-th best of the CANDS candidates in keys, SPLITS lists of TOPK
+            sorted best first, by a SPLITS-way merge (every wave, each row of 16
+            lanes, lane j heading list j): round r takes the best head and
+            advances its list. -> its candidate index, wave-uniform."""
+            j = lane % SPLITS
+
+            def pair(h):
+                x = 2 * (j * TOPK + fx.min(h, TOPK - 1))
+                live = h < TOPK
+                return (live.select(fx.ptr_load(keys + x), fx.Int32(KEY_NONE)),
+                        live.select(fx.ptr_load(keys + (x + 1)), fx.Int32(2 * PAD)))  # fmt: skip
+
+            h = fx.Int32(0)
+            kh, bh = pair(h)
+            idx = fx.Int32(-1)
+            for r in range(TOPK):
+                kn, bn = pair(h + 1)  # the next head, off the round's chain
+                mk = butterfly(kh, ROW16, fx.max)
+                mb = butterfly((kh == mk).select(bh, fx.Int32(2 * PAD)), ROW16, fx.min)
+                win = (kh == mk) & (bh == mb)
+                idx = (win & (r == s)).select(j * TOPK + h, idx)
+                h = h + win.select(fx.Int32(1), fx.Int32(0))
+                kh = win.select(kn, kh)
+                bh = win.select(bn, bh)
+            return uniform(butterfly(idx, ROW16, fx.max))
+
+        @traced
+        def select(k, s):
+            """Token k's s-th best block (-1: none) and its page, vLLM's top-TOPK (the higher
+            score, ties to the lower block): split s ranks its share, a SPLITS-th
+            of the token's blocks, and publishes its TOPK best; the context's TOPK
+            best are among the splits' candidates, which every split ranks."""
             nb = (kv_len(k) + BLK - 1) // BLK
-            n_live = (load_i32(seq_lens, k // q_len) + BLK - 1) // BLK
-            # this thread's blocks' scores, one poll batch (a dead block polls the
-            # request's first, always written, and is dropped)
-            bs = [tid + p * THREADS for p in range(SEL_PASSES)]
-            ss = [fx.Int32(MIN32) for _ in range(SEL_PASSES)]
-            if n_live > 0:  # a CUDA-graph pad row (seq_len 0) has no scores
-                got = mb_poll([(sreg("score"), k * MAX_BLOCKS + (b < n_live).select(b, 0), 1) for b in bs])
-                for p in range_constexpr(SEL_PASSES):
-                    bits = got[p][0]
-                    o = (bits < 0).select(bits ^ fx.Int32(0x7FFFFFFF), bits)
-                    ss[p] = (bs[p] < nb).select(o, fx.Int32(MIN32))
-            want = fx.min(nb, fx.Int32(TOPK))
-            # radix descent on the unsigned order u = key ^ MIN32: thr holds the
-            # decided high bits; digit d is kept while count(u >= thr | d) >= want
-            thr = fx.Int32(0)
-            for pas in range_constexpr(8):
-                sh = 28 - 4 * pas
-                buf = CNT + (pas % 2) * WAVES * DIGITS
-                for d in range_constexpr(1, DIGITS):
-                    cand = (thr | fx.Int32(i32(d << sh))) ^ fx.Int32(MIN32)
-                    cta_count(lambda p, c=cand: ss[p] >= c, buf, d)
-                gpu.barrier()
-                tot = fx.Int32(0)
-                for w in range_constexpr(WAVES):
-                    tot = tot + fx.ptr_load(keys + (buf + w * DIGITS + fx.min(fx.max(lane, 1), DIGITS - 1)))
-                ok = (lane >= 1) & (lane < DIGITS) & (tot >= want)
-                thr = thr | (popcount(ballot(ok)) << sh)  # counts fall with d
-            ts = thr ^ fx.Int32(MIN32)
-            # slots: above the threshold in block order, then ties in block order
-            gm = [ballot(ss[p] > ts) for p in range(SEL_PASSES)]
-            em = [ballot(ss[p] == ts) for p in range(SEL_PASSES)]
-            if lane == 0:
-                for p in range_constexpr(SEL_PASSES):
-                    fx.ptr_store(popcount(gm[p]), keys + (GT_CNT + p * WAVES + wave))
-                    fx.ptr_store(popcount(em[p]), keys + (EQ_CNT + p * WAVES + wave))
+            span = (nb + SPLITS - 1) // SPLITS
+            b = s * span + tid
+            live = (tid < span) & (b < nb)
+            key = fx.Int32(KEY_NONE)
+            if (nb > 0) & (tid < CAP):  # a CUDA-graph pad row (seq_len 0) has no scores
+                bits = mb_poll([(sreg("score"), k * MAX_BLOCKS + fx.min(b, nb - 1), 1)])[0][0]
+                key = (bits < 0).select(bits ^ fx.Int32(0x7FFFFFFF), bits)
+            stamp(8)
+            if tid < CAP:
+                fx.ptr_store(live.select(key, fx.Int32(KEY_NONE)), keys + tid)
             gpu.barrier()
-            if tid == 0:
-                sel_prefix()
+            c, rk, held = rank_of(CAP)
+            if held & (rk < TOPK):
+                # pads: below every block, distinct ids above every block's
+                lc = (s * span + c < nb) & (c < span)
+                bl = lc.select(s * span + c, fx.Int32(PAD) + s * CAP + c)
+                mb_put(sreg("cand"), 2 * ((k * SPLITS + s) * TOPK + rk), [fx.ptr_load(keys + c), bl])
             gpu.barrier()
-            n_gt = fx.ptr_load(keys + TOTALS)
-            ties = want - n_gt
-            below = (fx.Int64(1) << fx.Int64(lane)) - 1
-            for p in range_constexpr(SEL_PASSES):
-                gi = fx.ptr_load(keys + (GT_PRE + p * WAVES + wave)) + popcount(gm[p] & below)
-                ei = fx.ptr_load(keys + (EQ_PRE + p * WAVES + wave)) + popcount(em[p] & below)
-                is_gt = ss[p] > ts
-                take = is_gt | ((ss[p] == ts) & (ei < ties))
-                if take:
-                    mb_put(sreg("sel"), k * TOPK + is_gt.select(gi, n_gt + ei), [bs[p]])
-            if (tid >= want) & (tid < TOPK):
-                mb_put(sreg("sel"), k * TOPK + tid, [fx.Int32(-1)])
+            stamp(9)
+            if tid < CANDS:
+                got = mb_poll([(sreg("cand"), 2 * (k * CANDS + tid), 2)])[0]
+                fx.ptr_store(got[0], keys + 2 * tid)
+                fx.ptr_store(got[1], keys + (2 * tid + 1))
+                # its page, in flight during the merge
+                pg = load_i32(block_table, (k // q_len) * bt_stride + fx.max(fx.min(got[1], nb - 1), 0))
+                fx.ptr_store(pg, keys + (2 * CANDS + tid))
             gpu.barrier()
+            stamp(10)
+            c = nth_cand(s)
+            b = fx.ptr_load(keys + (2 * c + 1))
+            return (b < PAD).select(b, fx.Int32(-1)), fx.ptr_load(keys + (2 * CANDS + c))
 
         # ------------------------------------------------------------ attend
+        def q_frags(k):
+            """This lane's MFMA A operand of token k's q (rows = heads)."""
+            return [load(sreg("q"), (k * O_K + l16 * HEAD_DIM + kk * 16 + g4 * 4) // 2, 2, cm=CM_DEV)
+                    for kk in range(KK)]  # fmt: skip
+
         @traced
-        def attend(t):
-            """Token k, split s: PER_SPLIT selected blocks for all 16 heads.
+        def attend(t, b, pg, qa):
+            """Token k, split s: its selected block b on page pg (``select``) for
+            all 16 heads; qa: ``q_frags``.
             QK: wave w takes keys 16 w .. + 16 (MFMA A = q: rows = heads).
             P and V^T go through LDS; PV: wave w owns dims 16 w .. + 16.
             K and V are dequantized like vLLM's: fp8 -> bf16 (x scale -> bf16)."""
             k = t // SPLITS
             s = t % SPLITS
-            r = k // q_len
             klen = kv_len(k)
             ksc = load_f32(k_scale, 0)
             vsc = load_f32(v_scale, 0)
-            qa = [
-                load(sreg("q"), (k * O_K + l16 * HEAD_DIM + kk * 16 + g4 * 4) // 2, 2, cm=CM_DEV)
-                for kk in range(KK)
-            ]
             if tid < NQ:
                 fx.ptr_store(fx.Float32(NEG), hm + tid)
                 fx.ptr_store(fx.Float32(0.0), hm + (NQ + tid))
             o = fx.Vector.filled(4, 0.0, fx.Float32)
             kr = wave * 16 + l16
-            for j in range_constexpr(PER_SPLIT):
-                b = mb_poll([(sreg("sel"), k * TOPK + s * PER_SPLIT + j, 1)])[0][0]
-                live = b >= 0
-                page = kv_cache + fx.Int64(load_i32(block_table, r * bt_stride + fx.max(b, 0))) * kv_stride
-                # V^T -> LDS as bf16: vt[d][key]. Thread: one key's 16 dims, one
-                # 16 B load; every load of the block in flight together
-                v16 = fx.recast_iter(fx.Int16, vt)
-                vkey = tid // (HEAD_DIM // 16)
-                vd0 = (tid % (HEAD_DIM // 16)) * 16
-                vraw = [load(page, ((vkey + 64 * p) * KV_ROW + HEAD_DIM + vd0) // 4, 4, cm=CM_DEV)
-                        for p in range(BLK // 64)]  # fmt: skip
-                # QK^T: A = q (16 heads x 16 dims), B = K (16 keys x 16 dims)
-                kraw = [load_i32(page, (kr * KV_ROW + kk * 16 + g4 * 4) // 4, cm=CM_DEV) for kk in range(KK)]
-                for p in range_constexpr(BLK // 64):
-                    for wd in range_constexpr(4):
-                        vw = fp8x4_bf16(vraw[p][wd])
-                        for e in range_constexpr(4):
-                            v = bf16_round((bf_lo if e % 2 == 0 else bf_hi)(vw[e // 2]) * vsc)
-                            d = vd0 + wd * 4 + e
-                            bits = fx.Int32(fx.Uint32(v.bitcast(fx.Int32)) >> 16)
-                            fx.ptr_store(fx.Int16(bits), v16 + (d * BLK + vkey + 64 * p))
-                acc = fx.Vector.filled(4, 0.0, fx.Float32)
-                for kk in range_constexpr(KK):
-                    kw = fp8x4_bf16(kraw[kk])
-                    kw = [bf16_word(bf16_round(bf_lo(w) * ksc), bf16_round(bf_hi(w) * ksc)) for w in kw]
-                    acc = mfma_bf16([qa[kk][0], qa[kk][1]], kw, acc)
-                ok = live & (fx.max(b, 0) * BLK + kr < klen)
-                # acc[e]: head 4 g4 + e, key kr
-                for e in range_constexpr(4):
-                    fx.ptr_store(ok.select(acc[e] * SCALE_LOG2, fx.Float32(NEG)), red + ((4 * g4 + e) * BLK + kr))
-                gpu.barrier()
-                # softmax: half wave hh owns head hh's 128 keys, 4 a lane
-                hh = hw_
-                v4 = [fx.ptr_load(red + (hh * BLK + l32 * 4 + i)) for i in range(4)]
-                bm = butterfly(fx.max(fx.max(v4[0], v4[1]), fx.max(v4[2], v4[3])), (16, 8, 4, 2, 1), fx.max)
-                m_old = fx.ptr_load(hm + hh)
-                m_new = fx.max(m_old, bm)
-                m_safe = (m_new > NEG).select(m_new, fx.Float32(0.0))
-                p4 = [(v4[i] > NEG).select(hw_exp2(v4[i] - m_safe), fx.Float32(0.0)) for i in range(4)]
-                p16 = [bf16_round(p) for p in p4]
-                fx.ptr_store(bf16_word(p16[0], p16[1]), pt + (hh * (BLK // 2) + l32 * 2))
-                fx.ptr_store(bf16_word(p16[2], p16[3]), pt + (hh * (BLK // 2) + l32 * 2 + 1))
-                psum = butterfly(p4[0] + p4[1] + p4[2] + p4[3], (16, 8, 4, 2, 1))
-                gpu.barrier()
-                if l32 == 0:
-                    alpha = (m_old > NEG).select(hw_exp2(m_old - m_safe), fx.Float32(0.0))
-                    fx.ptr_store(m_new, hm + hh)
-                    fx.ptr_store(fx.ptr_load(hm + (NQ + hh)) * alpha + psum, hm + (NQ + hh))
-                    fx.ptr_store(alpha, hm + (2 * NQ + hh))
-                gpu.barrier()
-                # PV: A = P (16 heads x 16 keys), B = V^T (16 keys x 16 dims), wave w dims 16 w ..
-                alpha = [fx.ptr_load(hm + (2 * NQ + 4 * g4 + e)) for e in range(4)]
-                o = fx.Vector.from_elements([o[e] * alpha[e] for e in range(4)], fx.Float32)
-                for kc in range_constexpr(BLK // 16):
-                    pa = [fx.ptr_load(pt + (l16 * (BLK // 2) + kc * 8 + g4 * 2 + i)) for i in range(2)]
-                    vb = [fx.ptr_load(vt + ((wave * 16 + l16) * (BLK // 2) + kc * 8 + g4 * 2 + i)) for i in range(2)]
-                    o = mfma_bf16(pa, vb, o)
-                gpu.barrier()
+            live = b >= 0
+            page = kv_cache + fx.Int64(pg) * kv_stride
+            # V^T -> LDS as bf16: vt[d][key]. Thread: one key's 16 dims, one
+            # 16 B load; every load of the block in flight together
+            v16 = fx.recast_iter(fx.Int16, vt)
+            vkey = tid // (HEAD_DIM // 16)
+            vd0 = (tid % (HEAD_DIM // 16)) * 16
+            vraw = [load(page, ((vkey + 64 * p) * KV_ROW + HEAD_DIM + vd0) // 4, 4, cm=CM_DEV)
+                    for p in range(BLK // 64)]  # fmt: skip
+            # QK^T: A = q (16 heads x 16 dims), B = K (16 keys x 16 dims)
+            kraw = [load_i32(page, (kr * KV_ROW + kk * 16 + g4 * 4) // 4, cm=CM_DEV) for kk in range(KK)]
+            for p in range_constexpr(BLK // 64):
+                for wd in range_constexpr(4):
+                    vw = fp8x4_bf16(vraw[p][wd])
+                    for e in range_constexpr(4):
+                        v = bf16_round((bf_lo if e % 2 == 0 else bf_hi)(vw[e // 2]) * vsc)
+                        d = vd0 + wd * 4 + e
+                        bits = fx.Int32(fx.Uint32(v.bitcast(fx.Int32)) >> 16)
+                        fx.ptr_store(fx.Int16(bits), v16 + (d * BLK + vkey + 64 * p))
+            acc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for kk in range_constexpr(KK):
+                kw = fp8x4_bf16(kraw[kk])
+                kw = [bf16_word(bf16_round(bf_lo(w) * ksc), bf16_round(bf_hi(w) * ksc)) for w in kw]
+                acc = mfma_bf16([qa[kk][0], qa[kk][1]], kw, acc)
+            ok = live & (fx.max(b, 0) * BLK + kr < klen)
+            # acc[e]: head 4 g4 + e, key kr
+            for e in range_constexpr(4):
+                fx.ptr_store(ok.select(acc[e] * SCALE_LOG2, fx.Float32(NEG)), red + ((4 * g4 + e) * BLK + kr))
+            gpu.barrier()
+            # softmax: half wave hh owns head hh's 128 keys, 4 a lane
+            hh = hw_
+            v4 = [fx.ptr_load(red + (hh * BLK + l32 * 4 + i)) for i in range(4)]
+            bm = butterfly(fx.max(fx.max(v4[0], v4[1]), fx.max(v4[2], v4[3])), (16, 8, 4, 2, 1), fx.max)
+            m_old = fx.ptr_load(hm + hh)
+            m_new = fx.max(m_old, bm)
+            m_safe = (m_new > NEG).select(m_new, fx.Float32(0.0))
+            p4 = [(v4[i] > NEG).select(hw_exp2(v4[i] - m_safe), fx.Float32(0.0)) for i in range(4)]
+            p16 = [bf16_round(p) for p in p4]
+            fx.ptr_store(bf16_word(p16[0], p16[1]), pt + (hh * (BLK // 2) + l32 * 2))
+            fx.ptr_store(bf16_word(p16[2], p16[3]), pt + (hh * (BLK // 2) + l32 * 2 + 1))
+            psum = butterfly(p4[0] + p4[1] + p4[2] + p4[3], (16, 8, 4, 2, 1))
+            gpu.barrier()
+            if l32 == 0:
+                alpha = (m_old > NEG).select(hw_exp2(m_old - m_safe), fx.Float32(0.0))
+                fx.ptr_store(m_new, hm + hh)
+                fx.ptr_store(fx.ptr_load(hm + (NQ + hh)) * alpha + psum, hm + (NQ + hh))
+                fx.ptr_store(alpha, hm + (2 * NQ + hh))
+            gpu.barrier()
+            # PV: A = P (16 heads x 16 keys), B = V^T (16 keys x 16 dims), wave w dims 16 w ..
+            alpha = [fx.ptr_load(hm + (2 * NQ + 4 * g4 + e)) for e in range(4)]
+            o = fx.Vector.from_elements([o[e] * alpha[e] for e in range(4)], fx.Float32)
+            for kc in range_constexpr(BLK // 16):
+                pa = [fx.ptr_load(pt + (l16 * (BLK // 2) + kc * 8 + g4 * 2 + i)) for i in range(2)]
+                vb = [fx.ptr_load(vt + ((wave * 16 + l16) * (BLK // 2) + kc * 8 + g4 * 2 + i)) for i in range(2)]
+                o = mfma_bf16(pa, vb, o)
+            gpu.barrier()
             # o[e]: head 4 g4 + e, dim 16 wave + l16, unnormalized; lse in log2
             for e in range_constexpr(4):
                 hh = 4 * g4 + e
@@ -656,11 +653,11 @@ def build_attn(
             for s in range_constexpr(1, SPLITS):
                 mx = fx.max(mx, lse[s])
             wts = [(lse[s] > NEG).select(hw_exp2(lse[s] - mx), fx.Float32(0.0)) for s in range(SPLITS)]
+            po = mb_poll([(sreg("po"), (k * SPLITS + s) * O_K + hh * HEAD_DIM + d0 + 2 * h, 2)
+                          for s in range(SPLITS) for h in range(2)])  # fmt: skip
             tot = wts[0]
             for s in range_constexpr(1, SPLITS):
                 tot = tot + wts[s]
-            po = mb_poll([(sreg("po"), (k * SPLITS + s) * O_K + hh * HEAD_DIM + d0 + 2 * h, 2)
-                          for s in range(SPLITS) for h in range(2)])  # fmt: skip
             vals = []
             for i in range_constexpr(4):
                 acc = fx.Float32(0.0)
@@ -720,13 +717,13 @@ def build_attn(
         score_loop(sc0, fx.min(live_chunks * R, fx.Int32(SCORE_TASKS)))
         if sc0 < SCORE_TASKS:
             stamp(2)
-        if first("select") < M:
-            select(first("select"))
-            stamp(5)
         at0 = first("attend")
         if at0 < ATT_TASKS:
             wait_heads()
-            attend(at0)
+            qa = q_frags(at0 // SPLITS)
+            sel, pg = select(at0 // SPLITS, at0 % SPLITS)
+            stamp(5)
+            attend(at0, sel, pg, qa)
             stamp(6)
         if first("merge") < M:
             merge(first("merge"))

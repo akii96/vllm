@@ -12,7 +12,7 @@ import torch
 sys.path.insert(0, os.path.dirname(__file__))
 from test_attn_mono import FP8, attn_weights, make_case  # noqa: E402
 
-NAMES = ["start", "norm", "score_end", "heads_in", "end", "select", "attend", "merge"]
+NAMES = ["start", "norm", "score_end", "heads_in", "end", "select", "attend", "merge", "s_poll", "s_rank", "s_cands"]
 
 
 def main(M=8, q_len=1, ctx=8192):
