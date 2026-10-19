@@ -75,7 +75,7 @@ def test_builder_positions_fallback():
                 sparse_config=SimpleNamespace(region_block_size=REGION)
             )
         ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=64),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_num_seqs=8),
     )
     builder = Step5CSAMetadataBuilder(
         SimpleNamespace(tokens_per_state=1), [], config, torch.device("cuda")
@@ -89,3 +89,68 @@ def test_builder_positions_fallback():
     want_req = [r for r, q in enumerate(spec.query_lens) for _ in range(q)]
     assert md.positions.tolist() == want_pos
     assert md.token_req.tolist() == want_req
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="needs CUDA graph capture"
+)
+def test_builder_persistent_buffers_survive_graph_replay():
+    """A captured decode graph keeps reading the buffers it captured.
+
+    The builder must rewrite its persistent per-step buffers in place, so a
+    replayed graph observes the refreshed metadata of the current step
+    instead of the capture-time values.
+    """
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                sparse_config=SimpleNamespace(region_block_size=REGION)
+            )
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_num_seqs=8),
+    )
+    builder = Step5CSAMetadataBuilder(
+        SimpleNamespace(tokens_per_state=1), [], config, torch.device("cuda")
+    )
+
+    def build(seq_lens: list[int]):
+        m = create_common_attn_metadata(
+            BatchSpec(seq_lens=seq_lens, query_lens=[1] * len(seq_lens)),
+            block_size=16,
+            device=torch.device("cuda"),
+        )
+        return builder.build(0, m)
+
+    md1 = build([24, 8])
+    pos_out = torch.zeros(2, dtype=torch.int32, device="cuda")
+    regions_out = torch.zeros(2, 2, dtype=torch.int32, device="cuda")
+
+    def consume():
+        pos_out.copy_(md1.positions)
+        regions_out.copy_(md1.completed_regions)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        consume()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        consume()
+
+    md2 = build([40, 16])
+    assert md2.positions.data_ptr() == md1.positions.data_ptr(), (
+        "positions must live in a persistent builder buffer"
+    )
+    assert md2.completed_regions.data_ptr() == md1.completed_regions.data_ptr(), (
+        "completed_regions must live in a persistent builder buffer"
+    )
+    graph.replay()
+    assert pos_out.tolist() == md2.positions.tolist(), (
+        "replayed graph must observe the step-2 positions"
+    )
+    live2 = md2.completed_regions[md2.completed_regions[:, 0] >= 0]
+    live_out = regions_out[regions_out[:, 0] >= 0]
+    assert live_out.tolist() == live2.tolist(), (
+        "replayed graph must observe the step-2 completed regions"
+    )
