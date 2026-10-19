@@ -10,7 +10,11 @@ tokens without changing any shape.
 import pytest
 import torch
 
-from vllm.models.step5.common.ops.csa import round_e4m3, select_regions
+from vllm.models.step5.common.ops.csa import (
+    round_e4m3,
+    select_regions,
+    select_regions_fused,
+)
 from vllm.models.step5.common.ops.csa_paged import (
     compress_regions_paged,
     indexer_scores_paged,
@@ -163,6 +167,31 @@ def test_select_regions_breaks_ties_by_region_id():
     positions = torch.randint(0, 40 * REGION, (48,), device=DEVICE)
     got = select_regions(scores, positions, REGION, topk=6)
     assert torch.equal(got.cpu(), ref_select(scores, positions, 6))
+
+
+@pytest.mark.parametrize(
+    "tokens,groups,regions,topk",
+    [
+        (48, 2, 40, 6),  # non-power-of-two row, ties by id
+        (7, 3, 64, 512),  # keep limited by the row width, not topk
+        (5, 2, 300, 6),  # multi-byte radix
+        (3, 1, 1024, 64),  # full 4-byte radix
+    ],
+)
+def test_select_regions_fused_matches_reference(
+    tokens: int, groups: int, regions: int, topk: int
+):
+    """The fused radix select must equal the sort-based reference exactly,
+    including zero-score ties and the own-region slot placement."""
+    torch.manual_seed(0)
+    scores = torch.randn(tokens, groups, regions, device=DEVICE)
+    scores[scores.abs() < 0.5] = 0.0
+    positions = torch.randint(0, regions * REGION, (tokens,), device=DEVICE)
+    positions[0] = 0  # no visible history: only the own-region slot
+    positions[-1] = regions * REGION - 1  # own region id beyond topk
+    got = select_regions_fused(scores, positions, REGION, topk)
+    want = select_regions(scores, positions, REGION, topk)
+    assert torch.equal(got.cpu(), want.cpu())
 
 
 @pytest.mark.parametrize("topk", [6, 512])
