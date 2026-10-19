@@ -67,7 +67,11 @@ def _completed_regions(m: CommonAttentionMetadata, region_size: int) -> torch.Te
 
 
 class Step5CSAMetadataBuilder(AttentionMetadataBuilder[Step5CSAMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    # Decode batches are uniform (one query token per request, or
+    # 1 + num_speculative_tokens with MTP). The per-step tensors below are
+    # written into persistent buffers on every build(), so a captured graph
+    # replaying reads refreshed values from the same addresses.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(
         self,
@@ -80,8 +84,27 @@ class Step5CSAMetadataBuilder(AttentionMetadataBuilder[Step5CSAMetadata]):
         sparse = vllm_config.model_config.hf_text_config.sparse_config
         self.region_size = sparse.region_block_size
         self.per_token = int(kv_cache_spec.tokens_per_state) == 1
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_req_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
+            max_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        # Capture-time allocations pinned by a full CUDA graph replay; build()
+        # rewrites them in place each step. Work-list capacity bounds the
+        # regions completed by one step's tokens: region_size tokens complete
+        # at most one region per request.
+        self.positions_buffer = torch.empty(
+            max_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.work_capacity = max_tokens // self.region_size + (
+            vllm_config.scheduler_config.max_num_seqs
+        )
+        self.work_buffer = torch.full(
+            (self.work_capacity, 2),
+            -1,
             dtype=torch.int32,
             device=device,
         )
@@ -116,8 +139,11 @@ class Step5CSAMetadataBuilder(AttentionMetadataBuilder[Step5CSAMetadata]):
             )
         else:
             positions = m.positions[:n]
-        md.positions = positions.to(torch.int32)
-        md.completed_regions = _completed_regions(m, self.region_size)
+        self.positions_buffer[:n].copy_(positions)
+        md.positions = self.positions_buffer[:n]
+        work = _completed_regions(m, self.region_size)
+        self.work_buffer[: work.shape[0]].copy_(work)
+        md.completed_regions = self.work_buffer[: work.shape[0]]
         return md
 
 
