@@ -64,6 +64,10 @@ GFX942_ROWPACK_ARGS = (
 )
 # Tokens per CTA chunk of the row-packed scorer (64 per wave, 4 waves).
 GFX942_DECODE_BLOCK_K = 256
+# Prefill: 16-row groups of one sequence sharing a CTA, so each e2m1-decoded K
+# tile (the VALU bottleneck on gfx942) feeds this many MFMAs. 4 is the measured
+# knee (16k chunk @256k: 6.06 -> 4.78 ms; bit-identical).
+GFX942_PREFILL_GROUPS_PER_CTA = 4
 
 
 def _mxfp4_arch() -> str | None:
@@ -440,11 +444,16 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
         row_to_batch, local_starts, local_ends = compute_varqlen_windows(
             p.cu_seqlens_q, p.seq_lens, rows
         )
-        # 16-row groups that never cross a sequence (rows // 16 + batches
-        # bounds them without a host sync); unused groups stay empty.
-        groups = rows // SLOTS + batches
+        # 16-row groups that never cross a sequence; GPC consecutive groups of
+        # one sequence share a CTA (each decoded K tile feeds GPC MFMAs), so a
+        # sequence's group run is padded to a multiple of GPC.
+        # rows // (16 GPC) + batches super-groups bound it without a host sync;
+        # unused groups stay empty.
+        gpc = GFX942_PREFILL_GROUPS_PER_CTA
+        supers = rows // (SLOTS * gpc) + batches
+        groups = supers * gpc
         cu = p.cu_seqlens_q.to(torch.int64)
-        per_batch = (cu[1:] - cu[:-1] + SLOTS - 1) // SLOTS
+        per_batch = (cu[1:] - cu[:-1] + SLOTS * gpc - 1) // (SLOTS * gpc) * gpc
         group_base = torch.cumsum(per_batch, 0) - per_batch
         r = torch.arange(rows, device=dev)
         b = row_to_batch.to(torch.int64)
@@ -465,13 +474,20 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
         group_starts = torch.full((groups,), 2**31 - 1, dtype=torch.int32, device=dev)
         group_starts.scatter_reduce_(0, g, local_starts.to(torch.int32), "amin")
         group_starts = torch.where(group_ends > 0, group_starts, 0)
+        # Super-group windows: the union of its groups' (same-sequence) windows.
+        sg_ends = group_ends.view(supers, gpc).amax(1)
+        sg_starts = torch.where(
+            group_ends > 0, group_starts, torch.iinfo(torch.int32).max
+        ).view(supers, gpc).amin(1)
+        sg_starts = torch.where(sg_ends > 0, sg_starts, 0)
+        sg_to_batch = group_to_batch.view(supers, gpc).amax(1)
         cus = torch.cuda.get_device_properties(dev).multi_processor_count
         _, cta_info, num_ctas = compute_prefill_schedule(
-            group_to_batch.repeat(heads),
-            group_starts.repeat(heads),
-            group_ends.repeat(heads),
+            sg_to_batch.repeat(heads),
+            sg_starts.repeat(heads),
+            sg_ends.repeat(heads),
             GFX942_DECODE_BLOCK_K,
-            max(4 * cus, heads * groups),
+            max(4 * cus, heads * supers),
             p.max_seq_len,
         )
         # Page maxima are stored densely (2 * blocks), not padded to the
@@ -795,6 +811,7 @@ def mxfp4_gfx942_index_scores_prefill_planned(
         max_blocks_per_seq=plan.page64_table.shape[1],
         num_warps=plan.block_k // 64,
         head_dim=index_query.shape[-1],
+        groups_per_cta=GFX942_PREFILL_GROUPS_PER_CTA,
         **cache_kw,
     )
     _launch_rowpack_cached(
