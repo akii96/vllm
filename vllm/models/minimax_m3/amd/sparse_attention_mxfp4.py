@@ -267,6 +267,7 @@ class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
         """
         from vllm.models.minimax_m3.amd.ops.mxfp4_attn_gfx942 import (
             mxfp4_sparse_attend_gfx942,
+            mxfp4_sparse_attend_prefill_gfx942,
         )
 
         num_tokens = md.num_actual_tokens
@@ -298,12 +299,13 @@ class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
                 out[:nd], self.scale, **common,
             )  # fmt: skip
         # Many prefill rows select the same blocks: decode every block of the
-        # prefill requests once to bf16 instead of once per selecting row.
-        mxfp4_sparse_attend_gfx942(
+        # prefill requests once (exactly) to bf16 in AITER's page-16 layout and
+        # run AITER's sparse paged attention over it, as the fp8 cache does.
+        mxfp4_sparse_attend_prefill_gfx942(
             q[nd:], kv_cache, sparse_bt[nd * kvh : num_tokens * kvh],
             sparse_ctx[nd * kvh : num_tokens * kvh], out[nd:], self.scale,
-            prefill_block_table=p.block_table, prefill_seq_lens=p.seq_lens,
-            prefill_max_seq_len=p.max_seq_len, **common,
+            num_kv_heads=kvh, block_table=p.block_table, seq_lens=p.seq_lens,
+            max_seq_len=p.max_seq_len,
         )  # fmt: skip
         return output
 
