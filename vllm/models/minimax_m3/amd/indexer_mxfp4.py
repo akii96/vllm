@@ -12,6 +12,7 @@ attend's page table.
 """
 
 import inspect
+import os
 from dataclasses import dataclass, fields, replace
 from typing import ClassVar
 
@@ -322,6 +323,8 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
         self.is_gfx942 = _mxfp4_arch() == "gfx942"
         self._page64_table: torch.Tensor | None = None
         self._gfx942_buffers: dict[str, torch.Tensor] | None = None
+        self._prefill_page_max: torch.Tensor | None = None
+        self.vllm_config = vllm_config
         hf = vllm_config.model_config.hf_text_config
         sparse_cfg = getattr(hf, "sparse_attention_config", None) or {}
         tp = vllm_config.parallel_config.tensor_parallel_size
@@ -471,7 +474,23 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
             max(4 * cus, heads * groups),
             p.max_seq_len,
         )
-        width = _score_width(p.max_seq_len, MSA_SPARSE_BLOCK_SIZE)
+        # Page maxima are stored densely (2 * blocks), not padded to the
+        # top-k's power-of-two score width: at 16k rows x 512k this is the
+        # largest buffer in the indexer (1 GiB vs 2 GiB padded).
+        width = cdiv(p.max_seq_len, MSA_SPARSE_BLOCK_SIZE)
+        # One persistent page-max buffer sized for a full chunk at
+        # max_model_len, viewed per step: a fresh ~1 GiB allocation every
+        # prefill step (built ahead of the forward under async scheduling)
+        # fragments the cache allocator and OOMs the second 500k prefill.
+        need = heads * rows * KERNEL_PAGES_PER_BLOCK * width
+        if self._prefill_page_max is None or self._prefill_page_max.numel() < need:
+            cap_rows = max(rows, self.vllm_config.scheduler_config.max_num_batched_tokens)
+            cap_w = cdiv(self.max_model_len, MSA_SPARSE_BLOCK_SIZE)
+            self._prefill_page_max = torch.empty(
+                max(need, heads * cap_rows * KERNEL_PAGES_PER_BLOCK * cap_w),
+                dtype=torch.float32,
+                device=dev,
+            )
         return Gfx942PrefillPlan(
             page64_table=expand_block_table_page64(p.block_table),
             slot_of_row=slot.to(torch.int32),
@@ -480,10 +499,8 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
                 (heads, groups, 1, 4, SLOTS, 4), dtype=torch.uint8, device=dev
             ),
             slot_meta=slot_meta,
-            page_max=torch.empty(
-                (heads * rows, KERNEL_PAGES_PER_BLOCK * width),
-                dtype=torch.float32,
-                device=dev,
+            page_max=self._prefill_page_max[:need].view(
+                heads * rows, KERNEL_PAGES_PER_BLOCK * width
             ),
             cta_info=cta_info,
             num_ctas=num_ctas,
@@ -516,7 +533,11 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
     ) -> MiniMaxM3IndexerMxfp4Metadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
         work_map = plan = prefill_plan = None
-        if self.is_gfx942 and metadata.prefill is not None:
+        if (
+            self.is_gfx942
+            and metadata.prefill is not None
+            and not os.environ.get("VLLM_MINIMAX_M3_GFX942_UNPLANNED_PREFILL")
+        ):
             prefill_plan = self._gfx942_prefill_plan(metadata)
         d = metadata.decode
         if d is not None:
@@ -760,6 +781,10 @@ def mxfp4_gfx942_index_scores_prefill_planned(
     )
 
     rows, heads = index_query.shape[:2]
+    if plan.page_max is None:
+        # Too large to hold [H*rows, pages] at once (long context x full
+        # chunk): fall back to bounded per-sub-chunk planning by the caller.
+        raise RuntimeError("prefill plan without page_max buffer")
     k, k_scale, cache_kw = gfx942_mxfp4_cache_strides(index_pages)
     pack_prefill_rows_gfx942(index_query, plan.slot_of_row, plan.q_fp4, plan.q_scale)
     groups = plan.q_fp4.shape[0] * plan.q_fp4.shape[1]
@@ -947,8 +972,57 @@ class MiniMaxM3IndexerRocmMxfp4Impl(MiniMaxM3IndexerImpl):
         )
         if reason is not None:
             raise ValueError(f"MiniMax M3 MXFP4 indexer on ROCm {reason}")
+        cfg = get_current_vllm_config()
+        self._workspace_dims = (
+            cfg.scheduler_config.max_num_batched_tokens,
+            cfg.model_config.max_model_len,
+        )
         self.sparse_bt_buffer: torch.Tensor | None = None
         self.sparse_ctx_buffer: torch.Tensor | None = None
+
+    def reserve_workspace(self) -> None:
+        """Make the memory-profiling run see the transient score buffers of a
+        full prefill chunk at max_model_len.
+
+        The profile run skips ``forward`` (caches unbound), so without this the
+        fp32 ``[H, max_num_batched_tokens, blocks]`` score and page-max tensors
+        a long-context prefill allocates are unaccounted for and the KV cache
+        is sized into them (OOM at 512k / 16k-token chunks on TP4).
+        """
+        if _mxfp4_arch() != "gfx942":
+            return
+        rows, msl = self._workspace_dims
+        heads = self.num_index_heads
+        dev = self.index_cache.kv_cache.device
+        if dev.type != "cuda":
+            dev = torch.device("cuda", torch.cuda.current_device())
+        score = torch.empty(
+            (heads, rows, _score_width(msl, MSA_SPARSE_BLOCK_SIZE)),
+            dtype=torch.float32,
+            device=dev,
+        )
+        # The page-max buffer is persistent (built once by the metadata
+        # builder), but the profile runs before any build: charge it here.
+        page_max = torch.empty(
+            (heads * rows, 2 * cdiv(msl, MSA_SPARSE_BLOCK_SIZE)),
+            dtype=torch.float32,
+            device=dev,
+        )
+        # Touch both so the caching allocator's peak includes them.
+        score[0, 0, 0] = 0
+        page_max[0, 0] = 0
+        if not getattr(MiniMaxM3IndexerRocmMxfp4Impl, "_logged_reserve", False):
+            MiniMaxM3IndexerRocmMxfp4Impl._logged_reserve = True
+            from vllm.logger import init_logger
+
+            init_logger(__name__).info(
+                "MiniMax M3 MXFP4 indexer: reserving %.2f GiB of prefill "
+                "score workspace in the memory profile (rows=%d, max_len=%d)",
+                (score.numel() + page_max.numel()) * 4 / 2**30,
+                rows,
+                msl,
+            )
+        del score, page_max
 
     @property
     def pages_per_block(self) -> int:
@@ -980,7 +1054,9 @@ class MiniMaxM3IndexerRocmMxfp4Impl(MiniMaxM3IndexerImpl):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
-            return None, None  # profiling run; caches unbound
+            # Profiling run, caches unbound: charge the prefill transients.
+            self.reserve_workspace()
+            return None, None
         md = attn_metadata[self.index_cache.prefix]
         assert isinstance(md, MiniMaxM3IndexerMxfp4Metadata)
         num_tokens = md.num_actual_tokens
@@ -1061,17 +1137,30 @@ class MiniMaxM3IndexerRocmMxfp4Impl(MiniMaxM3IndexerImpl):
                 assert page16 is not None
                 assert md.prefill_row_req_id is not None
                 assert md.prefill_kv_lens is not None
-                assert md.gfx942_prefill_plan is not None
-                score = mxfp4_gfx942_index_scores_prefill_planned(
-                    iq[nd:],
-                    pages,
-                    md.prefill_kv_lens,
-                    md.gfx942_prefill_plan,
-                    max_seq_len=p.max_seq_len,
-                    scale=self.scale,
-                    init_blocks=self.init_blocks,
-                    local_blocks=self.local_blocks,
-                )
+                if md.gfx942_prefill_plan is not None:
+                    score = mxfp4_gfx942_index_scores_prefill_planned(
+                        iq[nd:],
+                        pages,
+                        md.prefill_kv_lens,
+                        md.gfx942_prefill_plan,
+                        max_seq_len=p.max_seq_len,
+                        scale=self.scale,
+                        init_blocks=self.init_blocks,
+                        local_blocks=self.local_blocks,
+                    )
+                else:
+                    score = mxfp4_gfx942_index_scores_prefill(
+                        iq[nd:],
+                        pages,
+                        p.block_table,
+                        p.cu_seqlens_q,
+                        p.seq_lens,
+                        md.prefill_num_valid_pages,
+                        max_seq_len=p.max_seq_len,
+                        scale=self.scale,
+                        init_blocks=self.init_blocks,
+                        local_blocks=self.local_blocks,
+                    )
                 sparse_bt, sparse_ctx = self._table_rows(nd, num_tokens)
                 pa_sparse_block_topk(
                     score,
