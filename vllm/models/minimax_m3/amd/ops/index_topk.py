@@ -1237,6 +1237,9 @@ def minimax_m3_index_score(
         block_table.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        # 8 warps, 2 stages: 16k-row chunk @512k 10.0 -> 6.7 ms (MI300X).
+        num_warps=8,
+        num_stages=2,
     )
     return score
 
