@@ -545,9 +545,131 @@ def mxfp4_sparse_attend_gfx942(
     return out
 
 
+@triton.jit
+def _dequant_page16_kernel(
+    cache_ptr,
+    bt_ptr,
+    seq_lens_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    map_ptr,
+    stride_cache_block,
+    stride_bt,
+    width,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    """Block ``j`` of request ``i``, side ``s`` (K heads then V heads), to exact
+    bf16 in AITER's shuffled page-16 layout at scratch slot ``i * width + j``
+    (K ``[page, H, D/8, 16, 8]``, V ``[page, H, 2, D, 8]``, 8 pages a slot),
+    and ``map[block] = slot``."""
+    i = tl.program_id(0)
+    j = tl.program_id(1)
+    side = tl.program_id(2)
+    seq_len = tl.load(seq_lens_ptr + i)
+    if j * BLOCK_TOKENS >= seq_len:
+        return
+    blk = tl.load(bt_ptr + i.to(tl.int64) * stride_bt + j)
+    slot = (i * width + j).to(tl.int64)
+    if side == 0:
+        tl.store(map_ptr + blk, slot.to(tl.int32))
+    HALF: tl.constexpr = D // 2
+    tok = tl.arange(0, BLOCK_TOKENS)
+    col = tl.arange(0, HALF)
+    page = cache_ptr + blk.to(tl.int64) * stride_cache_block + side * PAGE
+    raw = tl.load(page + tok[:, None] * HALF + col[None, :])
+    s32 = tl.load((page + BLOCK_TOKENS * HALF + tok * 4).to(tl.pointer_type(tl.int32)))
+    h = side % H
+    pg = slot * (BLOCK_TOKENS // 16) + tok // 16  # page-16 id within the scratch
+    t16 = tok % 16
+    for par in tl.static_range(2):
+        d = 2 * col + par
+        val = _dequant_half(raw, s32, col, 4 * par)
+        if side < H:
+            off = (
+                ((pg[:, None] * H + h) * (D // 8) + d[None, :] // 8) * 128
+                + t16[:, None] * 8
+                + d[None, :] % 8
+            )
+            tl.store(k_out_ptr + off, val)
+        else:
+            off = (
+                ((pg[:, None] * H + h) * 2 + t16[:, None] // 8) * (D * 8)
+                + d[None, :] * 8
+                + t16[:, None] % 8
+            )
+            tl.store(v_out_ptr + off, val)
+
+
+@triton.jit
+def _remap_table_kernel(bt_ptr, out_ptr, map_ptr, n, PER_BLOCK: tl.constexpr, BLK: tl.constexpr):
+    """Page-16 entries ``(block * 8 + j) * H + h`` onto the scratch slots."""
+    off = tl.program_id(0) * BLK + tl.arange(0, BLK)
+    m = off < n
+    e = tl.load(bt_ptr + off, mask=m, other=0)
+    slot = tl.load(map_ptr + e // PER_BLOCK, mask=m, other=0)
+    tl.store(out_ptr + off, slot * PER_BLOCK + e % PER_BLOCK, mask=m)
+
+
+def mxfp4_sparse_attend_prefill_gfx942(
+    q: torch.Tensor,  # [rows, Hq, 128] bf16
+    kv_cache: torch.Tensor,  # uint8 [blocks, 2H, 128, 68]
+    sparse_bt: torch.Tensor,  # int32 [rows * H, topk * 8] page-16 table
+    sparse_ctx: torch.Tensor,  # int32 [rows * H]
+    out: torch.Tensor,  # [rows, Hq, 128], contiguous
+    scale: float,
+    *,
+    num_kv_heads: int,
+    block_table: torch.Tensor,  # [reqs, max_blocks] the rows' requests
+    seq_lens: torch.Tensor,  # [reqs]
+    max_seq_len: int,
+) -> torch.Tensor:
+    """Prefill attend: every block of the rows' requests is dequantized once
+    (exactly) to bf16 in AITER's page-16 layout and the page-16 table is
+    remapped onto it, then AITER's sparse paged attention runs in bf16 -- the
+    same kernel the fp8 K/V cache path uses."""
+    from vllm.models.minimax_m3.amd.ops.sparse_pa import _run_gluon_decode
+
+    H = num_kv_heads
+    reqs = block_table.shape[0]
+    width = triton.cdiv(max_seq_len, PAGE_TOKENS)
+    pages = reqs * width * (PAGE_TOKENS // 16)
+    k_s = torch.empty((pages, H, HEAD_DIM // 8, 16, 8), dtype=torch.bfloat16, device=q.device)
+    v_s = torch.empty((pages, H, 2, HEAD_DIM, 8), dtype=torch.bfloat16, device=q.device)
+    # Zeroed: table padding past a row's context may name any block.
+    block_map = torch.zeros(kv_cache.shape[0], dtype=torch.int32, device=q.device)
+    _dequant_page16_kernel[(reqs, width, 2 * H)](
+        kv_cache,
+        block_table,
+        seq_lens,
+        k_s,
+        v_s,
+        block_map,
+        kv_cache.stride(0),
+        block_table.stride(0),
+        width,
+        H=H,
+        D=HEAD_DIM,
+        BLOCK_TOKENS=PAGE_TOKENS,
+        PAGE=PAGE_BYTES,
+        num_warps=4,
+    )
+    table = torch.empty_like(sparse_bt)
+    n = sparse_bt.numel()
+    _remap_table_kernel[(triton.cdiv(n, 1024),)](
+        sparse_bt, table, block_map, n, PER_BLOCK=(PAGE_TOKENS // 16) * H, BLK=1024
+    )
+    _run_gluon_decode(
+        q.contiguous(), k_s, v_s, table, sparse_ctx, H, scale, out, None, None
+    )
+    return out
+
 __all__ = [
     "DATA_BYTES",
     "SCALE_GROUP",
     "mxfp4_sparse_attend_gfx942",
+    "mxfp4_sparse_attend_prefill_gfx942",
     "store_kv_mxfp4_gfx942",
 ]
