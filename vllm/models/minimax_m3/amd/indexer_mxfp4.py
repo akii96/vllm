@@ -505,6 +505,44 @@ def mxfp4_index_topk_decode(
     )
 
 
+# (launcher, every pointer / scalar / stream the resolved call bakes in) ->
+# (FlyDSL CallState, resolved args). The decode indexer runs in the attention
+# layer's eager break, so each of the 60 layers pays the launcher's host-side
+# signature binding and cache-key build (~150 us) per step, more than the
+# kernel itself; a resolved CallState relaunches in ~10 us. Every operand of
+# the decode launch is a persistent buffer or the layer's index cache, so the
+# key set is small (layers x batch sizes) and stable.
+_ROWPACK_CALLS: dict[tuple, tuple] = {}
+
+
+def _launch_rowpack_cached(launcher, args: tuple) -> None:
+    key = (id(launcher),) + tuple(
+        (a.data_ptr(), tuple(a.shape), tuple(a.stride()))
+        if isinstance(a, torch.Tensor)
+        else (a.cuda_stream if isinstance(a, torch.cuda.Stream) else a)
+        for a in args
+    )
+    hit = _ROWPACK_CALLS.get(key)
+    if hit is not None:
+        hit[0](hit[1])
+        return
+    launcher(*args)  # compiles on first use and populates the CallState cache
+    try:
+        bound = launcher._sig.bind(*args)
+        bound.apply_defaults()
+        cache_key = launcher._build_full_cache_key(
+            bound.arguments,
+            owner_cls=None,
+            bound_self=None,
+            effective_hints=launcher._effective_compile_hints(),
+        )
+        state = launcher._call_state_cache[cache_key]
+        _ROWPACK_CALLS[key] = (state, tuple(bound.arguments.values()))
+    except (AttributeError, KeyError, TypeError):
+        # A FlyDSL without these internals: stay on the public launcher.
+        _ROWPACK_CALLS[key] = (lambda resolved: launcher(*args), None)
+
+
 def mxfp4_gfx942_index_scores_decode(
     index_query: torch.Tensor,
     index_pages: torch.Tensor,
@@ -524,10 +562,11 @@ def mxfp4_gfx942_index_scores_decode(
     page maxima into pinned 128-token block scores.
     """
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_page_max_fp4_rowpack_prefill_gfx942 import (  # noqa: E501
-        flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942,
+        compile_pa_mqa_page_max_fp4_rowpack_prefill_gfx942,
     )
 
     from .ops.mxfp4_gfx942 import (
+        KERNEL_HEADS,
         decode_page_max_to_block_scores_gfx942,
         gfx942_mxfp4_cache_strides,
         pack_decode_rows_gfx942,
@@ -544,23 +583,35 @@ def mxfp4_gfx942_index_scores_decode(
         query_len=query_len,
     )
     page_max = plan.page_max[: heads * rows]
-    flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942(
-        plan.q_fp4[:batch],
-        plan.q_scale[:batch],
-        k,
-        k_scale,
-        plan.page64_table,
-        slot_meta,
-        plan.group_to_batch[:batch],
-        plan.group_starts[:batch],
-        seq_lens,
-        max_seq_len,
-        page_max,
-        weight_scale=scale,
+    # Every page of each row's causal window is written by the scheduled
+    # CTAs and the fold below reads no further, so no -inf fill is needed.
+    launcher, _ = compile_pa_mqa_page_max_fp4_rowpack_prefill_gfx942(
         block_k=plan.block_k,
-        cta_info=plan.cta_info,
-        total_ctas=plan.num_ctas,
+        kv_block_size=64,
+        max_blocks_per_seq=plan.page64_table.shape[1],
+        num_warps=plan.block_k // 64,
+        head_dim=index_query.shape[-1],
         **cache_kw,
+    )
+    _launch_rowpack_cached(
+        launcher,
+        (
+            page_max,
+            plan.q_fp4[:batch],
+            plan.q_scale[:batch],
+            k,
+            k_scale,
+            plan.page64_table,
+            slot_meta,
+            plan.cta_info,
+            page_max.stride(0),
+            page_max.shape[1],
+            batch * KERNEL_HEADS,
+            page_max.numel(),
+            float(scale),
+            plan.num_ctas,
+            torch.cuda.current_stream(),
+        ),
     )
     score = _new_score(heads, rows, max_seq_len, index_query.device)
     decode_page_max_to_block_scores_gfx942(
