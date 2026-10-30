@@ -161,10 +161,11 @@ logger = init_logger(__name__)
 
 
 def use_gfx942_mxfp4_indexer(kv_cache_dtype: str, indexer_kv_dtype: str) -> bool:
-    """gfx942 MXFP4 index cache alongside an fp8 main K/V cache."""
+    """gfx942 MXFP4 index cache alongside an fp8 or MXFP4 main K/V cache."""
+    mode = get_kv_quant_mode(kv_cache_dtype)
     return (
         on_gfx942()
-        and get_kv_quant_mode(kv_cache_dtype) == KVQuantMode.FP8_PER_TENSOR
+        and (mode == KVQuantMode.FP8_PER_TENSOR or mode.is_mxfp4)
         and indexer_kv_dtype == "mxfp4"
     )
 
@@ -791,6 +792,13 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # index cache.
         self.use_nvfp4_kv = get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4
         self.use_mxfp4_kv = get_kv_quant_mode(self.kv_cache_dtype).is_mxfp4
+        if self.use_mxfp4_kv and on_gfx942() and self.indexer_kv_dtype != "mxfp4":
+            # The gfx942 attend reads the page table the MXFP4 indexer emits.
+            raise ValueError(
+                "--kv-cache-dtype mxfp4 on gfx942 needs "
+                "--attention-config '{\"indexer_kv_dtype\": \"mxfp4\"}', got "
+                f"indexer_kv_dtype={self.indexer_kv_dtype!r}"
+            )
         # Indexer and main attention are separate impls. This indexer is
         # ROCm-only, so the model selects it rather than the neutral
         # MiniMaxM3Indexer, which knows nothing about it and would pick its own.
@@ -1070,7 +1078,18 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         q = q.reshape(num_tokens, self.q_size)
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
-        if self.kv_cache.numel() != 0 and self.use_aiter_sparse_pa:
+        if self.kv_cache.numel() != 0 and self.use_mxfp4_kv:
+            from vllm.models.minimax_m3.amd.ops.mxfp4_attn_gfx942 import (
+                store_kv_mxfp4_gfx942,
+            )
+
+            store_kv_mxfp4_gfx942(
+                k.reshape(num_tokens, self.num_kv_heads, self.head_dim),
+                v.view(num_tokens, self.num_kv_heads, self.head_dim),
+                self.kv_cache,
+                main_slot_mapping,
+            )
+        elif self.kv_cache.numel() != 0 and self.use_aiter_sparse_pa:
             # The AITER sparse PA attend reads its own page-16 x-packed layout;
             # write K/V the way the fused path does, not as a flash cache.
             key_cache, value_cache = self.get_aiter_sparse_pa_kv_cache()
@@ -1757,8 +1776,13 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 vllm_config.cache_config.cache_dtype, indexer_kv_dtype
             )
             emits_table = impl_cls is not None or gfx942_mxfp4_index
-            if emits_table and minimax_m3_use_aiter_sparse_pa(
-                num_kv_heads, emits_sparse_block_table=True
+            # The gfx942 MXFP4 attend always reads the table its indexer emits.
+            gfx942_mxfp4_kv = on_gfx942() and kv_quant_mode.is_mxfp4
+            if emits_table and (
+                gfx942_mxfp4_kv
+                or minimax_m3_use_aiter_sparse_pa(
+                    num_kv_heads, emits_sparse_block_table=True
+                )
             ):
                 # One row per (token, kv head): the table addresses the attend's
                 # cache, not the index cache. Allocated here with the selection
