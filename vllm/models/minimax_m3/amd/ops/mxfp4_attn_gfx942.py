@@ -31,6 +31,7 @@ from vllm.models.minimax_m3.amd.ops.mxfp4_pages import (
     PAGE_BYTES,
     PAGE_TOKENS,
 )
+from vllm.models.minimax_m3.amd.ops.launch_cache import launch_cached
 from vllm.triton_utils import tl, triton
 
 SCALE_GROUP = 32
@@ -122,22 +123,15 @@ def store_kv_mxfp4_gfx942(
         )
     if num_tokens == 0:
         return
-    _store_kv_mxfp4_kernel[(num_tokens, 2 * num_heads)](
-        k,
-        v,
-        kv_cache,
-        slot_mapping,
-        k.stride(0),
-        k.stride(1),
-        v.stride(0),
-        v.stride(1),
-        kv_cache.stride(0),
-        H=num_heads,
-        D=HEAD_DIM,
-        BLOCK_TOKENS=PAGE_TOKENS,
-        PAGE=PAGE_BYTES,
-        num_warps=1,
-    )
+    launch_cached(
+        _store_kv_mxfp4_kernel,
+        (num_tokens, 2 * num_heads),
+        (
+            k, v, kv_cache, slot_mapping, k.stride(0), k.stride(1), v.stride(0),
+            v.stride(1), kv_cache.stride(0),
+        ),
+        dict(H=num_heads, D=HEAD_DIM, BLOCK_TOKENS=PAGE_TOKENS, PAGE=PAGE_BYTES, num_warps=1),
+    )  # fmt: skip
 
 
 @triton.jit
@@ -414,6 +408,28 @@ def _num_splits(num_programs: int, max_blocks: int, device: torch.device) -> int
     return splits
 
 
+_SPLIT_SCRATCH: dict = {}
+# Decode-sized partials only (<= 4096 rows x heads x splits, 34 MB).
+_SPLIT_SCRATCH_MAX = 4096
+
+
+def _split_scratch(programs: int, splits: int, group_pad: int, device: torch.device):
+    """Split-K partials, reused across layers and steps (the attends of one
+    stream run one after another), so the launches see stable pointers."""
+    key = (device, group_pad)
+    cur = _SPLIT_SCRATCH.get(key)
+    n = programs * splits
+    if cur is None or cur[0].shape[0] < n:
+        cur = (
+            torch.empty((n, group_pad, HEAD_DIM), dtype=torch.float32, device=device),
+            torch.empty((n, group_pad, 2), dtype=torch.float32, device=device),
+        )
+        _SPLIT_SCRATCH[key] = cur
+    return cur[0][:n].view(programs, splits, group_pad, HEAD_DIM), cur[1][:n].view(
+        programs, splits, group_pad, 2
+    )
+
+
 def mxfp4_sparse_attend_gfx942(
     q: torch.Tensor,  # [rows, Hq, 128] bf16
     kv_cache: torch.Tensor,  # uint8 [blocks, 2H, 128, 68]
@@ -489,7 +505,10 @@ def mxfp4_sparse_attend_gfx942(
     if num_splits is None:
         num_splits = _num_splits(programs, max_blocks, q.device)
     num_splits = max(1, min(num_splits, max_blocks))
-    if num_splits > 1:
+    if num_splits > 1 and programs * num_splits <= _SPLIT_SCRATCH_MAX:
+        part_acc, part_ml = _split_scratch(programs, num_splits, group_pad, q.device)
+    elif num_splits > 1:
+        # Large (prefill-fallback) calls: transient partials, not kept around.
         part_acc = torch.empty(
             (programs, num_splits, group_pad, HEAD_DIM), dtype=torch.float32, device=q.device
         )
@@ -498,50 +517,31 @@ def mxfp4_sparse_attend_gfx942(
         )
     else:
         part_acc = part_ml = out
-    _sparse_attn_mxfp4_kernel[(programs, num_splits)](
-        q,
-        kv_cache,
-        sparse_bt,
-        sparse_ctx,
-        out,
-        part_acc,
-        part_ml,
-        q.stride(0),
-        q.stride(1),
-        out.stride(0),
-        out.stride(1),
-        kv_cache.stride(0),
-        sparse_bt.stride(0),
-        bt_col_stride,
-        page_div,
-        scale * 1.4426950408889634,
-        H=H,
-        GROUP=group,
-        GROUP_PAD=group_pad,
-        D=HEAD_DIM,
-        BLOCK_TOKENS=PAGE_TOKENS,
-        PAGE=PAGE_BYTES,
-        MAX_BLOCKS=max_blocks,
-        NUM_SPLITS=num_splits,
-        MAX_BLOCKS_POW2=triton.next_power_of_2(max_blocks),
-        num_warps=4,
+    args = (
+        q, kv_cache, sparse_bt, sparse_ctx, out, part_acc, part_ml, q.stride(0),
+        q.stride(1), out.stride(0), out.stride(1), kv_cache.stride(0),
+        sparse_bt.stride(0), bt_col_stride, page_div, scale * 1.4426950408889634,
+    )  # fmt: skip
+    meta = dict(
+        H=H, GROUP=group, GROUP_PAD=group_pad, D=HEAD_DIM, BLOCK_TOKENS=PAGE_TOKENS,
+        PAGE=PAGE_BYTES, MAX_BLOCKS=max_blocks, NUM_SPLITS=num_splits,
+        MAX_BLOCKS_POW2=triton.next_power_of_2(max_blocks), num_warps=4,
         num_stages=1,
-        **extra,
-    )
+    )  # fmt: skip
+    if extra:
+        _sparse_attn_mxfp4_kernel[(programs, num_splits)](*args, **meta, **extra)
+    else:
+        # Decode runs in the layer's eager break once per layer and step:
+        # replay the resolved launch rather than re-binding its arguments.
+        launch_cached(_sparse_attn_mxfp4_kernel, (programs, num_splits), args, meta)
     if num_splits > 1:
-        _sparse_attn_reduce_kernel[(programs,)](
-            part_acc,
-            part_ml,
-            out,
-            out.stride(0),
-            out.stride(1),
-            H=H,
-            GROUP=group,
-            GROUP_PAD=group_pad,
-            D=HEAD_DIM,
-            NUM_SPLITS=num_splits,
-            num_warps=4,
-        )
+        launch_cached(
+            _sparse_attn_reduce_kernel,
+            (programs,),
+            (part_acc, part_ml, out, out.stride(0), out.stride(1)),
+            dict(H=H, GROUP=group, GROUP_PAD=group_pad, D=HEAD_DIM,
+                 NUM_SPLITS=num_splits, num_warps=4),
+        )  # fmt: skip
     return out
 
 
