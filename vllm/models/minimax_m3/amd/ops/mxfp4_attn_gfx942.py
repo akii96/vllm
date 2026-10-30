@@ -167,6 +167,49 @@ def _dequant_half(raw, s32, col, SHIFT: tl.constexpr):
 
 
 @triton.jit
+def _dequant_blocks_kernel(
+    cache_ptr,
+    bt_ptr,
+    seq_lens_ptr,
+    tmp_ptr,
+    map_ptr,
+    stride_cache_block,
+    stride_bt,
+    width,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    """Block ``j`` of prefill request ``i``, side ``s`` (K heads then V heads),
+    as exact bf16 rows ``[even 64 | odd 64]`` into slot ``i * width + j`` of the
+    scratch, and ``map[block] = slot``."""
+    i = tl.program_id(0)
+    j = tl.program_id(1)
+    side = tl.program_id(2)
+    seq_len = tl.load(seq_lens_ptr + i)
+    if j * BLOCK_TOKENS >= seq_len:
+        return
+    blk = tl.load(bt_ptr + i.to(tl.int64) * stride_bt + j)
+    slot = i * width + j
+    if side == 0:
+        tl.store(map_ptr + blk, slot)
+    HALF: tl.constexpr = D // 2
+    tok = tl.arange(0, BLOCK_TOKENS)
+    col = tl.arange(0, HALF)
+    page = cache_ptr + blk.to(tl.int64) * stride_cache_block + side * PAGE
+    raw = tl.load(page + tok[:, None] * HALF + col[None, :])
+    s32 = tl.load((page + BLOCK_TOKENS * HALF + tok * 4).to(tl.pointer_type(tl.int32)))
+    dst = (
+        tmp_ptr
+        + (slot.to(tl.int64) * (2 * H) + side) * (BLOCK_TOKENS * D)
+        + tok[:, None] * D
+        + col[None, :]
+    )
+    tl.store(dst, _dequant_half(raw, s32, col, 0))
+    tl.store(dst + HALF, _dequant_half(raw, s32, col, 4))
+
+@triton.jit
 def _page_ptrs(cache_ptr, entries, slot, b, page_div, stride_cache_block, h, tok, col,
                H: tl.constexpr, HALF: tl.constexpr, BLOCK_TOKENS: tl.constexpr,
                PAGE: tl.constexpr):
@@ -210,6 +253,9 @@ def _sparse_attn_mxfp4_kernel(
     MAX_BLOCKS: tl.constexpr,
     MAX_BLOCKS_POW2: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    tmp_ptr=None,
+    map_ptr=None,
+    BF16_SRC: tl.constexpr = False,
 ):
     pid = tl.program_id(0)  # row * H + kv head
     split = tl.program_id(1)
@@ -250,11 +296,32 @@ def _sparse_attn_mxfp4_kernel(
     entries = tl.load(bt_row + slot * bt_col_stride, mask=slot < MAX_BLOCKS, other=0)
     kp, vp, ksp, vsp = _page_ptrs(cache_ptr, entries, slot, b0, page_div, stride_cache_block,
                                   h, tok, col, H, HALF, BLOCK_TOKENS, PAGE)
-    live = b0 < b1
+    live = (b0 < b1) & (not BF16_SRC)
     k_raw = tl.load(kp, mask=live, other=0)
     k_s = tl.load(ksp, mask=live, other=0)
     v_raw = tl.load(vp, mask=live, other=0)
     v_s = tl.load(vsp, mask=live, other=0)
+    if BF16_SRC:
+        # Prefill: the blocks were dequantized once into the bf16 scratch.
+        SIDE: tl.constexpr = BLOCK_TOKENS * D
+        for b in range(b0, b1):
+            entry = tl.sum(tl.where(slot == b, entries, 0), axis=0)
+            sl = tl.load(map_ptr + entry // page_div).to(tl.int64)
+            kb = tmp_ptr + (sl * (2 * H) + h) * SIDE + tok[:, None] * D + col[None, :]
+            vb = kb + H * SIDE
+            s = tl.dot(q_even, tl.trans(tl.load(kb)))
+            s = tl.dot(q_odd, tl.trans(tl.load(kb + HALF)), s)
+            valid = b * BLOCK_TOKENS + tok < ctx
+            s = tl.where(valid[None, :], s * qk_scale, float("-inf"))
+            m_new = tl.maximum(m_i, tl.max(s, axis=1))
+            alpha = tl.exp2(m_i - m_new)
+            p = tl.exp2(s - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            pt = tl.trans(p.to(tl.bfloat16))
+            acc_e = tl.dot(tl.trans(tl.load(vb)), pt, acc_e * alpha[None, :])
+            acc_o = tl.dot(tl.trans(tl.load(vb + HALF)), pt, acc_o * alpha[None, :])
+            m_i = m_new
+        b1 = b0  # skip the MXFP4 loop below
     for b in range(b0, b1):
         nxt = b + 1 < b1
         kp, vp, ksp, vsp = _page_ptrs(cache_ptr, entries, slot, b + 1, page_div,
@@ -360,8 +427,18 @@ def mxfp4_sparse_attend_gfx942(
     bt_col_stride: int = 1,
     page_div: int = 1,
     num_splits: int | None = None,
+    prefill_block_table: torch.Tensor | None = None,
+    prefill_seq_lens: torch.Tensor | None = None,
+    prefill_max_seq_len: int = 0,
 ) -> torch.Tensor:
     """Attend each (row, KV head) to its selected MXFP4 pages.
+
+    With ``prefill_block_table`` / ``prefill_seq_lens`` (the block table and
+    KV lengths of the requests the rows belong to), every block of those
+    requests is first dequantized once into a bf16 scratch and the attend reads
+    that instead of re-decoding a block for every query row; the result is the
+    same (the dequantization is exact). This is the prefill path, where many
+    rows share blocks.
 
     Row ``r * H + h`` of ``sparse_bt`` lists the pages for query row ``r`` and
     KV head ``h``, compacted with the partial (causal tail) block last, and
@@ -382,6 +459,33 @@ def mxfp4_sparse_attend_gfx942(
     group = num_q_heads // H
     group_pad = max(16, triton.next_power_of_2(group))
     programs = rows * H
+    extra = {}
+    if prefill_block_table is not None:
+        assert prefill_seq_lens is not None and prefill_max_seq_len > 0
+        reqs = prefill_block_table.shape[0]
+        width = triton.cdiv(prefill_max_seq_len, PAGE_TOKENS)
+        tmp = torch.empty(
+            (reqs * width, 2 * H, PAGE_TOKENS, HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        block_map = torch.empty(kv_cache.shape[0], dtype=torch.int32, device=q.device)
+        _dequant_blocks_kernel[(reqs, width, 2 * H)](
+            kv_cache,
+            prefill_block_table,
+            prefill_seq_lens,
+            tmp,
+            block_map,
+            kv_cache.stride(0),
+            prefill_block_table.stride(0),
+            width,
+            H=H,
+            D=HEAD_DIM,
+            BLOCK_TOKENS=PAGE_TOKENS,
+            PAGE=PAGE_BYTES,
+            num_warps=4,
+        )
+        extra = dict(tmp_ptr=tmp, map_ptr=block_map, BF16_SRC=True)
     if num_splits is None:
         num_splits = _num_splits(programs, max_blocks, q.device)
     num_splits = max(1, min(num_splits, max_blocks))
@@ -422,6 +526,7 @@ def mxfp4_sparse_attend_gfx942(
         MAX_BLOCKS_POW2=triton.next_power_of_2(max_blocks),
         num_warps=4,
         num_stages=1,
+        **extra,
     )
     if num_splits > 1:
         _sparse_attn_reduce_kernel[(programs,)](
