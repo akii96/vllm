@@ -275,6 +275,66 @@ def store_k_gfx942(
 
 
 @triton.jit
+def _pack_prefill_rows_kernel(
+    q_ptr,
+    slot_of_row_ptr,
+    packed_ptr,
+    scale_ptr,
+    stride_q_row,
+    stride_q_head,
+    max_groups,
+    D: tl.constexpr,
+    SLOTS: tl.constexpr,
+):
+    """Prefill row ``r`` of index head ``h`` -> its slot in head ``h``'s
+    row-packed groups (slot map built once per step by the metadata builder)."""
+    r = tl.program_id(0)
+    h = tl.program_id(1)
+    d = tl.arange(0, D)
+    x = tl.load(
+        q_ptr + r.to(tl.int64) * stride_q_row + h * stride_q_head + d
+    ).to(tl.float32)
+    q, e8m0 = _mxfp4_quant_op(tl.reshape(x, (1, D)), D, 1, 32)
+    slot = tl.load(slot_of_row_ptr + r)
+    g = h * max_groups + slot // SLOTS
+    s = slot % SLOTS
+    t = tl.arange(0, D // 2)
+    tl.store(
+        packed_ptr + (g.to(tl.int64) * SLOTS + s) * (D // 2) + t,
+        tl.reshape(q, (D // 2,)).to(tl.uint8),
+    )
+    c = tl.arange(0, D // 32)
+    tl.store(
+        scale_ptr + g.to(tl.int64) * (D // 32) * SLOTS * 4 + c * SLOTS * 4 + s * 4,
+        tl.reshape(e8m0, (D // 32,)).to(tl.uint8),
+    )
+
+
+def pack_prefill_rows_gfx942(
+    index_query: torch.Tensor,  # [rows, H, 128]
+    slot_of_row: torch.Tensor,  # [>= rows] int32
+    q_fp4: torch.Tensor,  # [H, max_groups, 16, 64] uint8
+    q_scale: torch.Tensor,  # [H, max_groups, 1, 4, 16, 4] uint8
+) -> None:
+    """MXFP4-quantize every (row, head) of a prefill into its row-packed slot;
+    one launch for all heads."""
+    rows, heads = index_query.shape[:2]
+    if rows:
+        _pack_prefill_rows_kernel[(rows, heads)](
+            index_query,
+            slot_of_row,
+            q_fp4,
+            q_scale,
+            index_query.stride(0),
+            index_query.stride(1),
+            q_fp4.shape[1],
+            D=HEAD_DIM,
+            SLOTS=KERNEL_HEADS,
+            num_warps=1,
+        )
+
+
+@triton.jit
 def _decode_page_max_kernel(
     page_max_ptr,
     seq_lens_ptr,
@@ -290,13 +350,19 @@ def _decode_page_max_kernel(
     BLOCK: tl.constexpr,
     SENTINEL_INIT: tl.constexpr,
     SENTINEL_LOCAL: tl.constexpr,
+    KV_PER_ROW: tl.constexpr = False,
 ):
     """Two 64-token page maxima -> one pinned 128-token block score, reading
-    only the row's causal blocks (the page buffer past them is never written)."""
+    only the row's causal blocks (the page buffer past them is never written).
+    Decode derives each row's causal length from ``seq_lens``; prefill
+    (``KV_PER_ROW``) reads it per row."""
     row = tl.program_id(0)
     head = tl.program_id(1)
-    seq_len = tl.load(seq_lens_ptr + row // query_len)
-    kv_len = tl.maximum(seq_len - query_len + row % query_len + 1, 0)
+    if KV_PER_ROW:
+        kv_len = tl.load(seq_lens_ptr + row)
+    else:
+        seq_len = tl.load(seq_lens_ptr + row // query_len)
+        kv_len = tl.maximum(seq_len - query_len + row % query_len + 1, 0)
     valid = (kv_len + 127) // 128
     src = page_max_ptr + head.to(tl.int64) * stride_ph + row.to(tl.int64) * stride_pr
     dst = out_ptr + head.to(tl.int64) * stride_oh + row.to(tl.int64) * stride_or
@@ -325,16 +391,18 @@ def decode_page_max_to_block_scores_gfx942(
     local_blocks: int,
     sentinel_init: float,
     sentinel_local: float,
+    kv_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Row-packed scorer page maxima to pinned 128-token block scores.
 
     Only each row's causal blocks are read and written: the top-k reads no
-    further, and the scorer leaves pages past a row's window unwritten."""
+    further, and the scorer leaves pages past a row's window unwritten.
+    ``kv_lens`` (prefill) gives each row's causal length directly."""
     heads, rows, _ = out.shape
     if rows:
         _decode_page_max_kernel[(rows, heads)](
             page_max,
-            seq_lens,
+            kv_lens if kv_lens is not None else seq_lens,
             out,
             rows,
             query_len,
@@ -347,6 +415,7 @@ def decode_page_max_to_block_scores_gfx942(
             BLOCK=512,
             SENTINEL_INIT=sentinel_init,
             SENTINEL_LOCAL=sentinel_local,
+            KV_PER_ROW=kv_lens is not None,
             num_warps=4,
         )
     return out

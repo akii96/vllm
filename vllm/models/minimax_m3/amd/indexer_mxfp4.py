@@ -268,11 +268,35 @@ class Gfx942DecodePlan:
 
 
 @dataclass
+class Gfx942PrefillPlan:
+    """Per-step row-packing of the prefill rows, shared by every index layer.
+
+    Everything here depends only on the step's ragged layout (cu_seqlens,
+    causal windows), so it is built once in the metadata builder; a layer then
+    pays one Q-pack launch, the scorer and the page-max fold. All index heads
+    run in one scorer launch: head ``h``'s groups are offset by
+    ``h * max_groups`` and its output rows by ``h * rows``.
+    """
+
+    page64_table: torch.Tensor
+    slot_of_row: torch.Tensor  # [rows] int32, slot within one head's groups
+    q_fp4: torch.Tensor  # [H, max_groups, 16, 64] uint8
+    q_scale: torch.Tensor  # [H, max_groups, 1, 4, 16, 4] uint8
+    slot_meta: torch.Tensor  # [3, H * max_groups * 16] int32
+    page_max: torch.Tensor  # [H * rows, 2 * width] fp32
+    cta_info: torch.Tensor
+    num_ctas: int
+    block_k: int
+
+
+@dataclass
 class MiniMaxM3IndexerMxfp4Metadata(MiniMaxM3IndexerMSAMetadata):
-    """Adds the decode scorer's work map (gfx950) or decode plan (gfx942)."""
+    """Adds the decode scorer's work map (gfx950) or decode/prefill plans
+    (gfx942)."""
 
     decode_work_map: torch.Tensor | None = None
     gfx942_decode_plan: Gfx942DecodePlan | None = None
+    gfx942_prefill_plan: Gfx942PrefillPlan | None = None
 
 
 class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
@@ -390,6 +414,82 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
             block_k=GFX942_DECODE_BLOCK_K,
         )
 
+    def _gfx942_prefill_plan(self, metadata) -> Gfx942PrefillPlan:
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill_gfx942 import (  # noqa: E501
+            compute_prefill_schedule,
+            compute_varqlen_windows,
+        )
+
+        from .ops.mxfp4_gfx942 import (
+            KERNEL_HEADS as SLOTS,
+        )
+        from .ops.mxfp4_gfx942 import (
+            KERNEL_PAGES_PER_BLOCK,
+            expand_block_table_page64,
+        )
+
+        p = metadata.prefill
+        heads = self._gfx942_index_heads
+        rows = metadata.num_prefill_tokens
+        batches = p.seq_lens.shape[0]
+        dev = p.seq_lens.device
+        # Same windows the per-call path built, so scores stay bit-identical.
+        row_to_batch, local_starts, local_ends = compute_varqlen_windows(
+            p.cu_seqlens_q, p.seq_lens, rows
+        )
+        # 16-row groups that never cross a sequence (rows // 16 + batches
+        # bounds them without a host sync); unused groups stay empty.
+        groups = rows // SLOTS + batches
+        cu = p.cu_seqlens_q.to(torch.int64)
+        per_batch = (cu[1:] - cu[:-1] + SLOTS - 1) // SLOTS
+        group_base = torch.cumsum(per_batch, 0) - per_batch
+        r = torch.arange(rows, device=dev)
+        b = row_to_batch.to(torch.int64)
+        n = r - cu[b]
+        g = group_base[b] + n // SLOTS
+        slot = g * SLOTS + n % SLOTS
+        slots = groups * SLOTS
+        slot_meta = torch.zeros((3, heads * slots), dtype=torch.int32, device=dev)
+        slot_meta[0].fill_(-1)
+        for h in range(heads):
+            slot_meta[0, h * slots + slot] = (h * rows + r).to(torch.int32)
+            slot_meta[1, h * slots + slot] = local_starts.to(torch.int32)
+            slot_meta[2, h * slots + slot] = local_ends.to(torch.int32)
+        group_to_batch = torch.zeros(groups, dtype=torch.int32, device=dev)
+        group_to_batch.scatter_(0, g, row_to_batch.to(torch.int32))
+        group_ends = torch.zeros(groups, dtype=torch.int32, device=dev)
+        group_ends.scatter_reduce_(0, g, local_ends.to(torch.int32), "amax")
+        group_starts = torch.full((groups,), 2**31 - 1, dtype=torch.int32, device=dev)
+        group_starts.scatter_reduce_(0, g, local_starts.to(torch.int32), "amin")
+        group_starts = torch.where(group_ends > 0, group_starts, 0)
+        cus = torch.cuda.get_device_properties(dev).multi_processor_count
+        _, cta_info, num_ctas = compute_prefill_schedule(
+            group_to_batch.repeat(heads),
+            group_starts.repeat(heads),
+            group_ends.repeat(heads),
+            GFX942_DECODE_BLOCK_K,
+            max(4 * cus, heads * groups),
+            p.max_seq_len,
+        )
+        width = _score_width(p.max_seq_len, MSA_SPARSE_BLOCK_SIZE)
+        return Gfx942PrefillPlan(
+            page64_table=expand_block_table_page64(p.block_table),
+            slot_of_row=slot.to(torch.int32),
+            q_fp4=torch.zeros((heads, groups, SLOTS, 64), dtype=torch.uint8, device=dev),
+            q_scale=torch.zeros(
+                (heads, groups, 1, 4, SLOTS, 4), dtype=torch.uint8, device=dev
+            ),
+            slot_meta=slot_meta,
+            page_max=torch.empty(
+                (heads * rows, KERNEL_PAGES_PER_BLOCK * width),
+                dtype=torch.float32,
+                device=dev,
+            ),
+            cta_info=cta_info,
+            num_ctas=num_ctas,
+            block_k=GFX942_DECODE_BLOCK_K,
+        )
+
     def _work_map_buffer(self) -> torch.Tensor:
         if self._work_map_buf is None:
             from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
@@ -415,7 +515,9 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
         fast_build: bool = False,
     ) -> MiniMaxM3IndexerMxfp4Metadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
-        work_map = plan = None
+        work_map = plan = prefill_plan = None
+        if self.is_gfx942 and metadata.prefill is not None:
+            prefill_plan = self._gfx942_prefill_plan(metadata)
         d = metadata.decode
         if d is not None:
             # Both scorers compile the output width into their captured launch.
@@ -437,6 +539,7 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
             **{f.name: getattr(metadata, f.name) for f in fields(metadata)},
             decode_work_map=work_map,
             gfx942_decode_plan=plan,
+            gfx942_prefill_plan=prefill_plan,
         )
 
 
@@ -623,6 +726,83 @@ def mxfp4_gfx942_index_scores_decode(
         local_blocks=local_blocks,
         sentinel_init=SENTINEL_INIT,
         sentinel_local=SENTINEL_LOCAL,
+    )
+    return score
+
+
+def mxfp4_gfx942_index_scores_prefill_planned(
+    index_query: torch.Tensor,  # [rows, H, 128]
+    index_pages: torch.Tensor,
+    kv_lens: torch.Tensor,  # [rows] int32, causal length of each row
+    plan: Gfx942PrefillPlan,
+    *,
+    max_seq_len: int,
+    scale: float,
+    init_blocks: int,
+    local_blocks: int,
+) -> torch.Tensor:
+    """Signed, pinned 128-token block scores of every prefill row.
+
+    Three launches per layer: one MXFP4 pack of every (row, head) into the
+    step's row-packed groups, one row-packed scorer launch for all heads
+    (cached CallState), one page-max -> block-score fold that also pins.
+    Bit-identical to the per-head path.
+    """
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_page_max_fp4_rowpack_prefill_gfx942 import (  # noqa: E501
+        compile_pa_mqa_page_max_fp4_rowpack_prefill_gfx942,
+    )
+
+    from .ops.mxfp4_gfx942 import (
+        KERNEL_HEADS,
+        decode_page_max_to_block_scores_gfx942,
+        gfx942_mxfp4_cache_strides,
+        pack_prefill_rows_gfx942,
+    )
+
+    rows, heads = index_query.shape[:2]
+    k, k_scale, cache_kw = gfx942_mxfp4_cache_strides(index_pages)
+    pack_prefill_rows_gfx942(index_query, plan.slot_of_row, plan.q_fp4, plan.q_scale)
+    groups = plan.q_fp4.shape[0] * plan.q_fp4.shape[1]
+    page_max = plan.page_max
+    launcher, _ = compile_pa_mqa_page_max_fp4_rowpack_prefill_gfx942(
+        block_k=plan.block_k,
+        kv_block_size=64,
+        max_blocks_per_seq=plan.page64_table.shape[1],
+        num_warps=plan.block_k // 64,
+        head_dim=index_query.shape[-1],
+        **cache_kw,
+    )
+    _launch_rowpack_cached(
+        launcher,
+        (
+            page_max,
+            plan.q_fp4.view(groups, KERNEL_HEADS, -1),
+            plan.q_scale.view(groups, *plan.q_scale.shape[2:]),
+            k,
+            k_scale,
+            plan.page64_table,
+            plan.slot_meta,
+            plan.cta_info,
+            page_max.stride(0),
+            page_max.shape[1],
+            groups * KERNEL_HEADS,
+            page_max.numel(),
+            float(scale),
+            plan.num_ctas,
+            torch.cuda.current_stream(),
+        ),
+    )
+    score = _new_score(heads, rows, max_seq_len, index_query.device)
+    decode_page_max_to_block_scores_gfx942(
+        page_max.view(heads, rows, -1),
+        kv_lens,
+        score,
+        query_len=1,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        sentinel_init=SENTINEL_INIT,
+        sentinel_local=SENTINEL_LOCAL,
+        kv_lens=kv_lens,
     )
     return score
 
@@ -881,13 +1061,12 @@ class MiniMaxM3IndexerRocmMxfp4Impl(MiniMaxM3IndexerImpl):
                 assert page16 is not None
                 assert md.prefill_row_req_id is not None
                 assert md.prefill_kv_lens is not None
-                score = mxfp4_gfx942_index_scores_prefill(
+                assert md.gfx942_prefill_plan is not None
+                score = mxfp4_gfx942_index_scores_prefill_planned(
                     iq[nd:],
                     pages,
-                    p.block_table,
-                    p.cu_seqlens_q,
-                    p.seq_lens,
-                    md.prefill_num_valid_pages,
+                    md.prefill_kv_lens,
+                    md.gfx942_prefill_plan,
                     max_seq_len=p.max_seq_len,
                     scale=self.scale,
                     init_blocks=self.init_blocks,
