@@ -851,6 +851,81 @@ def mxfp4_gfx942_index_scores_prefill_planned(
     return score
 
 
+def mxfp4_gfx942_index_scores_prefill_fp8copy(
+    index_query: torch.Tensor,  # [rows, H, 128] bf16
+    index_pages: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    context_lens: torch.Tensor,
+    num_valid_pages: torch.Tensor,
+    *,
+    max_query_len: int,
+    max_seq_len: int,
+    scale: float,
+    init_blocks: int,
+    local_blocks: int,
+) -> torch.Tensor:
+    """Prefill index scores from an exact e4m3fnuz copy of the MXFP4 index K.
+
+    e2m1 * 2^e with the RMS-normed index K's block exponents is exactly
+    representable in e4m3fnuz, so the transient fp8 copy holds the same K the
+    MXFP4 scorer decodes; the copy (~0.05 ms / 512k tokens) feeds the fp8 MFMA
+    Triton score kernel the fp8 indexer uses. Q is rounded to e4m3fnuz per
+    element there (the fp8 indexer's Q precision; finer than MXFP4 Q).
+    The copy is gathered in request-block order into a compact buffer so it
+    never needs the cache's full size.
+    """
+    from .ops.index_topk import minimax_m3_index_score
+    from .ops.mxfp4_gfx942 import mxfp4_pages_to_fp8_gfx942
+
+    rows, heads = index_query.shape[:2]
+    nblk = block_table.shape[1]
+    batch = block_table.shape[0]
+    fp8 = current_platform.fp8_dtype()
+    need = batch * nblk
+    buf = _FP8_COPY.get(index_pages.device)
+    if buf is None or buf.shape[0] < need:
+        buf = torch.empty((need, 128, 128), dtype=fp8, device=index_pages.device)
+        _FP8_COPY[index_pages.device] = buf
+    from .ops.mxfp4_gfx942 import MANAGER_BLOCK_BYTES
+
+    mxfp4_pages_to_fp8_gfx942(
+        index_pages.reshape(-1, MANAGER_BLOCK_BYTES),
+        block_table.reshape(-1),
+        buf[:need],
+    )
+    compact_bt = torch.arange(need, dtype=torch.int32, device=block_table.device).view(
+        batch, nblk
+    )
+    score = minimax_m3_index_score(
+        index_query.to(fp8),
+        buf[:need],
+        compact_bt,
+        cu_seqlens_q,
+        seq_lens,
+        context_lens,
+        max_query_len,
+        max_seq_len,
+        heads,
+    )
+    # The top-k reads power-of-two-padded rows; copy into that layout.
+    out = _new_score(heads, rows, max_seq_len, index_query.device)
+    w = min(out.shape[2], score.shape[2])
+    torch.mul(score[..., :w], scale, out=out[..., :w])
+    score = out
+    _pin_forced_blocks(
+        score,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        num_valid_pages=num_valid_pages,
+    )
+    return score
+
+
+_FP8_COPY: dict[torch.device, torch.Tensor] = {}
+
+
 def mxfp4_gfx942_index_scores_prefill(
     index_query,
     index_pages,
@@ -1156,7 +1231,22 @@ class MiniMaxM3IndexerRocmMxfp4Impl(MiniMaxM3IndexerImpl):
                 assert page16 is not None
                 assert md.prefill_row_req_id is not None
                 assert md.prefill_kv_lens is not None
-                if md.gfx942_prefill_plan is not None:
+                if os.environ.get("VLLM_MINIMAX_M3_GFX942_FP8COPY_PREFILL") == "1":
+                    score = mxfp4_gfx942_index_scores_prefill_fp8copy(
+                        iq[nd:],
+                        pages,
+                        p.block_table,
+                        p.cu_seqlens_q,
+                        p.seq_lens,
+                        p.context_lens,
+                        md.prefill_num_valid_pages,
+                        max_query_len=p.max_query_len,
+                        max_seq_len=p.max_seq_len,
+                        scale=self.scale,
+                        init_blocks=self.init_blocks,
+                        local_blocks=self.local_blocks,
+                    )
+                elif md.gfx942_prefill_plan is not None:
                     score = mxfp4_gfx942_index_scores_prefill_planned(
                         iq[nd:],
                         pages,

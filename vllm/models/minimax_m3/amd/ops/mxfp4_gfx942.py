@@ -335,6 +335,85 @@ def pack_prefill_rows_gfx942(
 
 
 @triton.jit
+def _e2m1(code):
+    m = code & 7
+    ex = (m >> 1).to(tl.float32)
+    mag = tl.where(
+        m < 2,
+        m.to(tl.float32) * 0.5,
+        (1.0 + 0.5 * (m & 1).to(tl.float32)) * tl.exp2(ex - 1.0),
+    )
+    return tl.where((code & 8) != 0, -mag, mag)
+
+
+@triton.jit
+def _pages_to_fp8_kernel(
+    cache_ptr,  # [blocks, BLOCK_BYTES] uint8 MXFP4 index cache
+    src_ptr,  # [cap] int32 physical block of compact block i (-1: unused)
+    out_ptr,  # [cap, 128, 128] fp8 (e4m3fnuz)
+    PAGE_TOKENS: tl.constexpr,
+    CHUNK_BYTES: tl.constexpr,
+    PAGE_DATA: tl.constexpr,
+    PAGE_SLOT: tl.constexpr,
+    BLOCK_BYTES: tl.constexpr,
+):
+    """One (compact block, 64-token page, 32-dim chunk) MXFP4 -> e4m3fnuz.
+
+    e2m1 * 2^(e-127) is exactly representable in e4m3fnuz whenever the scaled
+    value is a normal/subnormal e4m3fnuz number (|x| in [2^-10, 240]); the
+    index K after its RMSNorm sits well inside that range.
+    """
+    i = tl.program_id(0)
+    half = tl.program_id(1)
+    c = tl.program_id(2)
+    phys = tl.load(src_ptr + i)
+    if phys < 0:
+        return
+    page = cache_ptr + phys.to(tl.int64) * BLOCK_BYTES + half * PAGE_SLOT
+    t = tl.arange(0, PAGE_TOKENS)
+    b = tl.arange(0, CHUNK_BYTES)
+    raw = tl.load(
+        page + (c * PAGE_TOKENS + t[:, None]) * CHUNK_BYTES + b[None, :]
+    ).to(tl.int32)
+    e = tl.load(page + PAGE_DATA + c * PAGE_TOKENS + (t % 16) * 4 + t // 16)
+    scale = tl.exp2(e.to(tl.float32) - 127.0)
+    lo = _e2m1(raw & 15) * scale[:, None]
+    hi = _e2m1(raw >> 4) * scale[:, None]
+    vals = tl.interleave(lo, hi)  # [64, 32], dim 2*byte + {lo, hi}
+    d = tl.arange(0, 2 * CHUNK_BYTES)
+    dst = (
+        out_ptr
+        + i.to(tl.int64) * (2 * PAGE_TOKENS) * 128
+        + (half * PAGE_TOKENS + t[:, None]) * 128
+        + c * (2 * CHUNK_BYTES)
+        + d[None, :]
+    )
+    tl.store(dst, vals.to(out_ptr.dtype.element_ty))
+
+
+def mxfp4_pages_to_fp8_gfx942(
+    cache: torch.Tensor, src_blocks: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """Gather ``src_blocks`` of the MXFP4 index cache into a compact e4m3fnuz
+    ``[cap, 128, 128]`` copy (blocks with src -1 are skipped)."""
+    cache = _check_cache(cache)
+    cap = src_blocks.shape[0]
+    if cap:
+        _pages_to_fp8_kernel[(cap, KERNEL_PAGES_PER_BLOCK, K_CHUNKS)](
+            cache,
+            src_blocks,
+            out,
+            PAGE_TOKENS=KERNEL_PAGE_TOKENS,
+            CHUNK_BYTES=K_CHUNK_BYTES,
+            PAGE_DATA=PAGE_DATA_BYTES,
+            PAGE_SLOT=PAGE_SLOT_BYTES,
+            BLOCK_BYTES=MANAGER_BLOCK_BYTES,
+            num_warps=2,
+        )
+    return out
+
+
+@triton.jit
 def _decode_page_max_kernel(
     page_max_ptr,
     seq_lens_ptr,
