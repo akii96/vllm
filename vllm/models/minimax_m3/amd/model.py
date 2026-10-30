@@ -1070,16 +1070,26 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         q = q.reshape(num_tokens, self.q_size)
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
-        if self.kv_cache.numel() != 0:
-            if self.use_aiter_sparse_pa:
-                cache = self.kv_cache
-                if is_quantized_kv_cache(self.kv_cache_dtype):
-                    cache = cache.view(self.impl.kv_cache_fp8_dtype)
-                key_cache, value_cache = cache.unbind(1)
-            else:
-                key_cache, value_cache = self.kv_cache.transpose(1, 2).split(
-                    self.head_dim, dim=-1
-                )
+        if self.kv_cache.numel() != 0 and self.use_aiter_sparse_pa:
+            # The AITER sparse PA attend reads its own page-16 x-packed layout;
+            # write K/V the way the fused path does, not as a flash cache.
+            key_cache, value_cache = self.get_aiter_sparse_pa_kv_cache()
+            self._insert_aiter_sparse_pa_kv(
+                k,
+                v.view(num_tokens, self.num_kv_heads, self.head_dim),
+                None,
+                self._get_aiter_sparse_pa_slot_mapping(
+                    main_slot_mapping, key_cache, value_cache
+                ),
+                None,
+                key_cache,
+                value_cache,
+            )
+        elif self.kv_cache.numel() != 0:
+            # [block, head, token, 2 * dim] -> [block, token, head, dim].
+            key_cache, value_cache = self.kv_cache.transpose(1, 2).split(
+                self.head_dim, dim=-1
+            )
             triton_reshape_and_cache_flash(
                 k,
                 v.view(num_tokens, self.num_kv_heads, self.head_dim),
