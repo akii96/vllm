@@ -197,6 +197,43 @@ def pack_decode_rows_gfx942(
 
 
 @triton.jit
+def store_k_row_gfx942(
+    x,  # [D] fp32 (already rounded to the activation dtype)
+    cache_ptr,
+    slot,
+    D: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    PAGE_TOKENS: tl.constexpr,
+    CHUNK_BYTES: tl.constexpr,
+    PAGE_DATA: tl.constexpr,
+    PAGE_SLOT: tl.constexpr,
+    BLOCK_BYTES: tl.constexpr,
+):
+    """MXFP4-quantize one index-K row and store it into its cache slot:
+    the in-kernel twin of ``store_k_gfx942`` (same quant op, same layout),
+    for fusing into the producer of K."""
+    valid = slot >= 0
+    s = tl.maximum(slot, 0).to(tl.int64)
+    block = s // BLOCK_TOKENS
+    in_block = s % BLOCK_TOKENS
+    page_off = in_block % PAGE_TOKENS
+    page = block * BLOCK_BYTES + (in_block // PAGE_TOKENS) * PAGE_SLOT
+    q, e8m0 = _mxfp4_quant_op(tl.reshape(x, (1, D)), D, 1, 32)
+    byte = tl.arange(0, D // 2)
+    data_off = (byte // CHUNK_BYTES * PAGE_TOKENS + page_off) * CHUNK_BYTES + (
+        byte % CHUNK_BYTES
+    )
+    tl.store(cache_ptr + page + data_off, tl.reshape(q, (D // 2,)).to(tl.uint8), mask=valid)
+    chunk = tl.arange(0, D // 32)
+    scale_off = PAGE_DATA + chunk * PAGE_TOKENS + (page_off % 16) * 4 + page_off // 16
+    tl.store(
+        cache_ptr + page + scale_off,
+        tl.reshape(e8m0, (D // 32,)).to(tl.uint8),
+        mask=valid,
+    )
+
+
+@triton.jit
 def _store_k_kernel(
     packed_ptr,
     scale_ptr,
