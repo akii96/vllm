@@ -233,6 +233,100 @@ def store_k_row_gfx942(
     )
 
 
+# e4m3fnuz max is 240; mapping max|q| to 224 keeps a margin for rounding.
+FP8Q_ROW_MAX = 224.0
+
+
+@triton.jit
+def _pack_decode_rows_fp8_kernel(
+    q_ptr,
+    packed_ptr,
+    scale_ptr,
+    meta_ptr,
+    seq_lens_ptr,
+    stride_q_row,
+    stride_q_head,
+    rows,
+    slots,
+    HEADS: tl.constexpr,
+    QUERY_LEN: tl.constexpr,
+    D: tl.constexpr,
+    SLOTS: tl.constexpr,
+    ROW_MAX: tl.constexpr,
+):
+    """FP8-Q variant of ``_pack_decode_rows_kernel``: slot ``h * QUERY_LEN + r``
+    of request ``b``'s group holds e4m3fnuz ``q * ROW_MAX / max|q|`` and the
+    fp32 per-slot scale ``max|q| / ROW_MAX``."""
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    slot = b * SLOTS + s
+    live = s < HEADS * QUERY_LEN
+    head = s // QUERY_LEN
+    r = s % QUERY_LEN
+    row = b * QUERY_LEN + r
+    d = tl.arange(0, D)
+    x = tl.load(
+        q_ptr + row.to(tl.int64) * stride_q_row + head * stride_q_head + d,
+        mask=live & (d < D),
+        other=0.0,
+    ).to(tl.float32)
+    amax = tl.max(tl.abs(x), axis=0)
+    # Correctly rounded divides, so the bytes and scale are reproducible by a
+    # host-side (torch) quantization.
+    safe = tl.where(amax > 0, amax, 1.0)
+    inv = tl.where(amax > 0, tl.math.div_rn(ROW_MAX + tl.zeros_like(safe), safe), 0.0)
+    q8 = (x * inv).to(tl.float8e4b8)
+    tl.store(packed_ptr + slot.to(tl.int64) * D + d, q8.to(tl.uint8, bitcast=True))
+    tl.store(scale_ptr + slot, tl.math.div_rn(amax, ROW_MAX + tl.zeros_like(amax)))
+    seq_len = tl.load(seq_lens_ptr + b)
+    end = tl.maximum(seq_len - QUERY_LEN + r + 1, 0)
+    tl.store(meta_ptr + slot, tl.where(live, head * rows + row, -1))
+    tl.store(meta_ptr + slots + slot, 0)
+    tl.store(meta_ptr + 2 * slots + slot, tl.where(live, end, 0))
+
+
+def pack_decode_rows_fp8_gfx942(
+    index_query: torch.Tensor,  # [batch * query_len, H, 128]
+    seq_lens: torch.Tensor,  # [batch] int32
+    q_fp8: torch.Tensor,  # [>= batch, 16, 128] uint8 (e4m3fnuz bytes)
+    q_scale: torch.Tensor,  # [>= batch, 16] fp32
+    slot_meta: torch.Tensor,  # [>= 3 * 16 * batch] int32, flat
+    *,
+    query_len: int,
+) -> torch.Tensor:
+    """FP8-Q counterpart of :func:`pack_decode_rows_gfx942` for the row-packed
+    scorer's ``q_fp8`` mode: Q is e4m3fnuz with one fp32 scale per slot (max
+    |q| -> 224). Returns the ``[3, slots]`` slot metadata view."""
+    batch = seq_lens.shape[0]
+    heads = index_query.shape[1]
+    if heads * query_len > KERNEL_HEADS:
+        raise ValueError(
+            f"{heads} index heads x {query_len} decode rows exceed the "
+            f"{KERNEL_HEADS}-slot MFMA group"
+        )
+    slots = batch * KERNEL_HEADS
+    meta = slot_meta[: 3 * slots].view(3, slots)
+    if batch:
+        _pack_decode_rows_fp8_kernel[(batch, KERNEL_HEADS)](
+            index_query,
+            q_fp8,
+            q_scale,
+            meta,
+            seq_lens,
+            index_query.stride(0),
+            index_query.stride(1),
+            batch * query_len,
+            slots,
+            HEADS=heads,
+            QUERY_LEN=query_len,
+            D=HEAD_DIM,
+            SLOTS=KERNEL_HEADS,
+            ROW_MAX=FP8Q_ROW_MAX,
+            num_warps=1,
+        )
+    return meta
+
+
 @triton.jit
 def _store_k_kernel(
     packed_ptr,
