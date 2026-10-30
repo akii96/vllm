@@ -487,7 +487,9 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
             sg_starts.repeat(heads),
             sg_ends.repeat(heads),
             GFX942_DECODE_BLOCK_K,
-            max(4 * cus, heads * supers),
+            # 8 CTAs/CU: long-context prefill runs split each super-group's
+            # window over more CTAs (16k chunk @256k: 4.85 -> 4.51 ms).
+            max(8 * cus, heads * supers),
             p.max_seq_len,
         )
         # Page maxima are stored densely (2 * blocks), not padded to the
