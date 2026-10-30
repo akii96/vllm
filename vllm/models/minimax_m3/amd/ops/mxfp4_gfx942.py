@@ -24,9 +24,8 @@ KERNEL_PAGES_PER_BLOCK = MANAGER_BLOCK_TOKENS // KERNEL_PAGE_TOKENS
 PACKED_DIM = HEAD_DIM // 2
 K_CHUNKS = HEAD_DIM // 32
 K_CHUNK_BYTES = 16
-# The scorer's MFMA M tile; MiniMax fills slot 0 and zero-weights the rest.
+# The row-packed scorer's MFMA M tile: 16 query rows share each decoded K tile.
 KERNEL_HEADS = 16
-Q_SCALE_PAD = 4
 PAGE_DATA_BYTES = KERNEL_PAGE_TOKENS * PACKED_DIM
 PAGE_SCALE_BYTES = KERNEL_PAGE_TOKENS * K_CHUNKS
 PAGE_SLOT_BYTES = PAGE_DATA_BYTES + PAGE_SCALE_BYTES
@@ -105,72 +104,96 @@ def gfx942_mxfp4_cache_views(
 
 
 @triton.jit
-def _quantize_q_kernel(
+def _pack_decode_rows_kernel(
     q_ptr,
     packed_ptr,
     scale_ptr,
-    weights_ptr,
-    stride_q,
+    meta_ptr,
+    seq_lens_ptr,
+    stride_q_row,
+    stride_q_head,
+    rows,
+    slots,
+    HEADS: tl.constexpr,
+    QUERY_LEN: tl.constexpr,
     D: tl.constexpr,
     SLOTS: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
-    chunks: tl.constexpr = D // 32
-    x = tl.load(q_ptr + row * stride_q + tl.arange(0, D)).to(tl.float32)
+    """Slot ``h * QUERY_LEN + r`` of request ``b``'s 16-row group holds index
+    head ``h`` of its decode row ``r``: MXFP4 data, its e8m0 bytes in the
+    row-packed scale layout and the slot's output row and causal end."""
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    slot = b * SLOTS + s
+    live = s < HEADS * QUERY_LEN
+    head = s // QUERY_LEN
+    r = s % QUERY_LEN
+    row = b * QUERY_LEN + r
+    d = tl.arange(0, D)
+    x = tl.load(
+        q_ptr + row.to(tl.int64) * stride_q_row + head * stride_q_head + d,
+        mask=live & (d < D),
+        other=0.0,
+    ).to(tl.float32)
     q, e8m0 = _mxfp4_quant_op(tl.reshape(x, (1, D)), D, 1, 32)
-
-    tile: tl.constexpr = SLOTS * D // 2
-    t = tl.arange(0, tile)
-    qv = tl.reshape(q, (D // 2,)).to(tl.int32)
-    packed = tl.sum(
-        tl.where(t[:, None] == tl.arange(0, D // 2)[None, :], qv[None, :], 0), axis=1
+    t = tl.arange(0, D // 2)
+    tl.store(
+        packed_ptr + slot.to(tl.int64) * (D // 2) + t,
+        tl.reshape(q, (D // 2,)).to(tl.uint8),
     )
-    tl.store(packed_ptr + row * tile + t, packed.to(tl.uint8))
-
-    # [chunk][slot][pad]: slot 0 carries the row's e8m0, every other byte is 0.
-    n: tl.constexpr = chunks * SLOTS * 4
-    s = tl.arange(0, n)
-    e = tl.reshape(e8m0, (chunks,)).to(tl.int32)
-    scale = tl.sum(
-        tl.where((s[:, None] // (SLOTS * 4)) == tl.arange(0, chunks)[None, :], e, 0),
-        axis=1,
+    # [group, chunk, slot, pad=4]: byte 0 of each slot's pad is live.
+    c = tl.arange(0, D // 32)
+    tl.store(
+        scale_ptr + b.to(tl.int64) * (D // 32) * SLOTS * 4 + c * SLOTS * 4 + s * 4,
+        tl.reshape(e8m0, (D // 32,)).to(tl.uint8),
     )
-    scale = tl.where(s % (SLOTS * 4) == 0, scale, 0)
-    tl.store(scale_ptr + row * n + s, scale.to(tl.uint8))
+    seq_len = tl.load(seq_lens_ptr + b)
+    end = tl.maximum(seq_len - QUERY_LEN + r + 1, 0)
+    # Dead slots are never stored: output row -1, empty window.
+    tl.store(meta_ptr + slot, tl.where(live, head * rows + row, -1))
+    tl.store(meta_ptr + slots + slot, 0)
+    tl.store(meta_ptr + 2 * slots + slot, tl.where(live, end, 0))
 
-    w = tl.where(tl.arange(0, SLOTS) == 0, 1.0, 0.0)
-    tl.store(weights_ptr + row * SLOTS + tl.arange(0, SLOTS), w.to(tl.bfloat16))
 
-
-def quantize_q_gfx942(
-    index_query: torch.Tensor, head: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """MXFP4 of one index-Q head as the scorer's 16-slot tile, its preshuffled
-    scales and the one-hot slot weights."""
-    rows = index_query.shape[0]
-    src = index_query[:, head]
-    if src.stride(-1) != 1:
-        src = src.contiguous()
-    dev = index_query.device
-    packed = torch.empty(
-        (rows, KERNEL_HEADS, PACKED_DIM), dtype=torch.uint8, device=dev
-    )
-    scales = torch.empty(
-        (rows, 1, K_CHUNKS, KERNEL_HEADS, Q_SCALE_PAD), dtype=torch.uint8, device=dev
-    )
-    weights = torch.empty((rows, KERNEL_HEADS), dtype=torch.bfloat16, device=dev)
-    if rows:
-        _quantize_q_kernel[(rows,)](
-            src,
-            packed,
-            scales,
-            weights,
-            src.stride(0),
+def pack_decode_rows_gfx942(
+    index_query: torch.Tensor,  # [batch * query_len, H, 128]
+    seq_lens: torch.Tensor,  # [batch] int32
+    q_fp4: torch.Tensor,  # [>= batch, 16, 64] uint8
+    q_scale: torch.Tensor,  # [>= batch, 1, 4, 16, 4] uint8
+    slot_meta: torch.Tensor,  # [>= 3 * 16 * batch] int32, flat
+    *,
+    query_len: int,
+) -> torch.Tensor:
+    """Pack every (index head, decode row) of a request into one 16-slot MFMA
+    group for AITER's row-packed page-max scorer; returns the ``[3, slots]``
+    slot metadata view. Score rows are laid out ``head * rows + row``."""
+    batch = seq_lens.shape[0]
+    heads = index_query.shape[1]
+    if heads * query_len > KERNEL_HEADS:
+        raise ValueError(
+            f"{heads} index heads x {query_len} decode rows exceed the "
+            f"{KERNEL_HEADS}-slot MFMA group"
+        )
+    slots = batch * KERNEL_HEADS
+    meta = slot_meta[: 3 * slots].view(3, slots)
+    if batch:
+        _pack_decode_rows_kernel[(batch, KERNEL_HEADS)](
+            index_query,
+            q_fp4,
+            q_scale,
+            meta,
+            seq_lens,
+            index_query.stride(0),
+            index_query.stride(1),
+            batch * query_len,
+            slots,
+            HEADS=heads,
+            QUERY_LEN=query_len,
             D=HEAD_DIM,
             SLOTS=KERNEL_HEADS,
             num_warps=1,
         )
-    return packed, scales, weights
+    return meta
 
 
 @triton.jit
@@ -252,45 +275,50 @@ def store_k_gfx942(
 
 
 @triton.jit
-def _decode_block_scores_kernel(
-    logits_ptr,
+def _decode_page_max_kernel(
+    page_max_ptr,
     seq_lens_ptr,
     out_ptr,
-    max_seq_len,
-    width,
+    rows,
     query_len,
     init_blocks,
     local_blocks,
-    stride_l,
-    stride_o,
-    BLOCK_TOKENS: tl.constexpr,
-    BLOCKS: tl.constexpr,
+    stride_ph,
+    stride_pr,
+    stride_oh,
+    stride_or,
+    BLOCK: tl.constexpr,
     SENTINEL_INIT: tl.constexpr,
     SENTINEL_LOCAL: tl.constexpr,
 ):
+    """Two 64-token page maxima -> one pinned 128-token block score, reading
+    only the row's causal blocks (the page buffer past them is never written)."""
     row = tl.program_id(0)
-    blk = tl.program_id(1) * BLOCKS + tl.arange(0, BLOCKS)
-    tok = blk[:, None] * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)[None, :]
-    x = tl.load(
-        logits_ptr + row.to(tl.int64) * stride_l + tok,
-        mask=tok < max_seq_len,
-        other=float("-inf"),
-    )
-    score = tl.max(x, axis=1)
+    head = tl.program_id(1)
     seq_len = tl.load(seq_lens_ptr + row // query_len)
     kv_len = tl.maximum(seq_len - query_len + row % query_len + 1, 0)
-    valid = (kv_len + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-    in_ctx = blk < valid
-    score = tl.where(in_ctx & (blk < init_blocks), SENTINEL_INIT, score)
-    local = in_ctx & (blk >= tl.maximum(valid - local_blocks, 0))
-    score = tl.where(local, SENTINEL_LOCAL, score)
-    tl.store(out_ptr + row.to(tl.int64) * stride_o + blk, score, mask=blk < width)
+    valid = (kv_len + 127) // 128
+    src = page_max_ptr + head.to(tl.int64) * stride_ph + row.to(tl.int64) * stride_pr
+    dst = out_ptr + head.to(tl.int64) * stride_oh + row.to(tl.int64) * stride_or
+    for start in range(0, valid, BLOCK):
+        blk = start + tl.arange(0, BLOCK)
+        live = blk < valid
+        pair = tl.load(
+            src + 2 * blk[:, None] + tl.arange(0, 2)[None, :],
+            mask=live[:, None] & ((2 * blk[:, None] + tl.arange(0, 2)[None, :]) * 64
+                                  < kv_len),
+            other=float("-inf"),
+        )
+        score = tl.max(pair, axis=1)
+        score = tl.where(blk < init_blocks, SENTINEL_INIT, score)
+        score = tl.where(blk >= tl.maximum(valid - local_blocks, 0), SENTINEL_LOCAL, score)
+        tl.store(dst + blk, score, mask=live)
 
 
-def decode_block_scores_gfx942(
-    logits: torch.Tensor,
+def decode_page_max_to_block_scores_gfx942(
+    page_max: torch.Tensor,  # [H, rows, >= 2 * blocks] fp32 64-token page maxima
     seq_lens: torch.Tensor,
-    out: torch.Tensor,
+    out: torch.Tensor,  # [H, rows, width] fp32
     *,
     query_len: int,
     init_blocks: int,
@@ -298,24 +326,27 @@ def decode_block_scores_gfx942(
     sentinel_init: float,
     sentinel_local: float,
 ) -> torch.Tensor:
-    """Token logits ``[rows, max_seq_len]`` to pinned 128-token block scores."""
-    rows, max_seq_len = logits.shape
-    blocks = 16
-    _decode_block_scores_kernel[(rows, triton.cdiv(out.shape[1], blocks))](
-        logits,
-        seq_lens,
-        out,
-        max_seq_len,
-        out.shape[1],
-        query_len,
-        init_blocks,
-        local_blocks,
-        logits.stride(0),
-        out.stride(0),
-        BLOCK_TOKENS=MANAGER_BLOCK_TOKENS,
-        BLOCKS=blocks,
-        SENTINEL_INIT=sentinel_init,
-        SENTINEL_LOCAL=sentinel_local,
-        num_warps=4,
-    )
+    """Row-packed scorer page maxima to pinned 128-token block scores.
+
+    Only each row's causal blocks are read and written: the top-k reads no
+    further, and the scorer leaves pages past a row's window unwritten."""
+    heads, rows, _ = out.shape
+    if rows:
+        _decode_page_max_kernel[(rows, heads)](
+            page_max,
+            seq_lens,
+            out,
+            rows,
+            query_len,
+            init_blocks,
+            local_blocks,
+            page_max.stride(0),
+            page_max.stride(1),
+            out.stride(0),
+            out.stride(1),
+            BLOCK=512,
+            SENTINEL_INIT=sentinel_init,
+            SENTINEL_LOCAL=sentinel_local,
+            num_warps=4,
+        )
     return out

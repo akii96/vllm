@@ -16,12 +16,10 @@ from vllm.models.minimax_m3.amd.ops.mxfp4_gfx942 import (
     MANAGER_BLOCK_BYTES,
     PAGE_DATA_BYTES,
     PAGE_SCALE_BYTES,
-    decode_block_scores_gfx942,
     expand_block_table_page64,
     expand_block_table_page64_into,
     gfx942_mxfp4_cache_strides,
     gfx942_mxfp4_cache_views,
-    quantize_q_gfx942,
     store_k_gfx942,
 )
 from vllm.models.minimax_m3.amd.ops.mxfp4_pages import (
@@ -148,25 +146,6 @@ requires_gpu_aiter = pytest.mark.skipif(
 
 
 @requires_gpu_aiter
-def test_gfx942_q_quant_matches_dynamic_mxfp4_quant():
-    """Slot 0 of the tile is the row's MXFP4, scales in the preshuffled order."""
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-
-    torch.manual_seed(0)
-    iq = (torch.randn(9, 2, 128, device="cuda") * 3).to(torch.bfloat16)
-    iq[0, 0, :32] = 0
-    for head in range(2):
-        q, s, w = quantize_q_gfx942(iq, head)
-        ref_q, ref_s = dynamic_mxfp4_quant(iq[:, head].contiguous())
-        ref_s = ref_s.view(torch.uint8).view(9, 4)
-        assert torch.equal(q[:, 0], ref_q) and not q[:, 1:].any()
-        assert torch.equal(s[:, 0, :, 0, 0], ref_s)
-        s[:, 0, :, 0, 0] = 0
-        assert not s.any()
-        assert torch.equal(w[:, 0], torch.ones_like(w[:, 0])) and not w[:, 1:].any()
-
-
-@requires_gpu_aiter
 def test_gfx942_store_k_round_trips_through_dense_pages():
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
@@ -183,32 +162,6 @@ def test_gfx942_store_k_round_trips_through_dense_pages():
         assert torch.equal(data[page, 0, :, off].flatten(), ref_q[t])
         scale = scales[page, 0].view(4, 16, 4)[:, off % 16, off // 16]
         assert torch.equal(scale, ref_s[t])
-
-
-@requires_gpu_aiter
-def test_gfx942_decode_block_scores_reduce_and_pin():
-    """Two MTP rows of one request see 256 and 257 tokens: the local block is
-    block 1 for the first and block 2 for the second."""
-    torch.manual_seed(0)
-    logits = torch.randn(2, 400, device="cuda")
-    seq_lens = torch.tensor([257], dtype=torch.int32, device="cuda")
-    out = torch.empty((2, 4), device="cuda")
-    decode_block_scores_gfx942(
-        logits,
-        seq_lens,
-        out,
-        query_len=2,
-        init_blocks=1,
-        local_blocks=1,
-        sentinel_init=1e30,
-        sentinel_local=1e29,
-    )
-    padded = torch.nn.functional.pad(logits.cpu(), (0, 112), value=float("-inf"))
-    expect = padded.view(2, 4, 128).amax(-1)
-    expect[:, 0] = 1e30
-    expect[0, 1] = 1e29
-    expect[1, 2] = 1e29
-    assert torch.equal(out.cpu(), expect)
 
 
 @requires_gpu_aiter
@@ -253,8 +206,80 @@ def test_gfx942_index_norm_rope_matches_eager(default_vllm_config, tokens):
     assert torch.equal(k, ref_k.reshape(tokens, 128))
 
 
-def test_gfx942_requires_signed_in_place_scorers(monkeypatch):
-    """A ReLU-only or dense-only AITER is rejected at selection, not mid-step."""
+@requires_gpu_aiter
+@pytest.mark.parametrize("heads,query_len", [(1, 4), (2, 4), (4, 4), (1, 1)])
+def test_gfx942_pack_decode_rows(heads, query_len):
+    """Slot h*query_len + r of request b's group is head h of row r: its MXFP4,
+    its e8m0 bytes, output row h*rows + row and causal end; dead slots are
+    never stored."""
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+    from vllm.models.minimax_m3.amd.ops.mxfp4_gfx942 import pack_decode_rows_gfx942
+
+    torch.manual_seed(0)
+    batch = 3
+    rows = batch * query_len
+    iq = (torch.randn(rows, heads, 128, device="cuda") * 3).to(torch.bfloat16)
+    seq_lens = torch.tensor([7, 300, 4097], dtype=torch.int32, device="cuda")
+    q = torch.full((batch + 1, 16, 64), 0xAB, dtype=torch.uint8, device="cuda")
+    qs = torch.zeros((batch + 1, 1, 4, 16, 4), dtype=torch.uint8, device="cuda")
+    meta = torch.zeros(3 * 16 * (batch + 1), dtype=torch.int32, device="cuda")
+    m = pack_decode_rows_gfx942(iq, seq_lens, q, qs, meta, query_len=query_len)
+    assert m.shape == (3, 16 * batch)
+    for b in range(batch):
+        for s in range(16):
+            slot = 16 * b + s
+            if s >= heads * query_len:
+                assert m[0, slot] == -1 and m[2, slot] == 0
+                continue
+            h, r = divmod(s, query_len)
+            row = b * query_len + r
+            ref_q, ref_s = dynamic_mxfp4_quant(iq[row, h][None].contiguous())
+            assert torch.equal(q[b, s], ref_q[0])
+            assert torch.equal(qs[b, 0, :, s, 0], ref_s.view(torch.uint8)[0])
+            assert m[0, slot] == h * rows + row
+            assert m[1, slot] == 0
+            assert m[2, slot] == int(seq_lens[b]) - query_len + r + 1
+
+
+@requires_gpu_aiter
+def test_gfx942_decode_page_max_reduce_and_pin():
+    """64-token page maxima fold into 128-token block scores over each row's
+    causal blocks only; a half-filled last block ignores its unwritten page."""
+    from vllm.models.minimax_m3.amd.ops.mxfp4_gfx942 import (
+        decode_page_max_to_block_scores_gfx942,
+    )
+
+    torch.manual_seed(0)
+    pages = torch.randn(1, 2, 8, device="cuda")
+    # Row 1 (kv_len 257) owns pages 0..4; page 5 is unwritten garbage.
+    pages[0, 1, 5] = 1e9
+    seq_lens = torch.tensor([257], dtype=torch.int32, device="cuda")
+    out = torch.full((1, 2, 4), -7.0, device="cuda")
+    decode_page_max_to_block_scores_gfx942(
+        pages,
+        seq_lens,
+        out,
+        query_len=2,
+        init_blocks=1,
+        local_blocks=1,
+        sentinel_init=1e30,
+        sentinel_local=1e29,
+    )
+    p = pages.cpu()[0]
+    # row 0: kv_len 256 -> blocks 0, 1
+    assert out[0, 0, 0] == 1e30 and out[0, 0, 1] == 1e29
+    assert (out[0, 0, 2:] == -7.0).all()
+    # row 1: kv_len 257 -> blocks 0, 1, 2; block 2 is page 4 only
+    assert out[0, 1, 0] == 1e30
+    assert out[0, 1, 1] == torch.maximum(p[1, 2], p[1, 3]).item()
+    assert out[0, 1, 2] == 1e29
+    assert out[0, 1, 3] == -7.0
+
+
+def test_gfx942_requires_scheduled_in_place_rowpack_scorer(monkeypatch):
+    """An AITER whose row-packed scorer cannot read the paged cache in place or
+    take a caller schedule is rejected at selection, not mid-step."""
     import sys
     import types
 
@@ -263,15 +288,16 @@ def test_gfx942_requires_signed_in_place_scorers(monkeypatch):
     def full(
         q,
         *a,
-        relu=True,
         kv_page_stride=None,
         kv_scale_page_stride=None,
         kv_scale_offset=0,
+        cta_info=None,
+        total_ctas=None,
         **k,
     ):
         pass
 
-    def relu_only(
+    def unscheduled(
         q,
         *a,
         kv_page_stride=None,
@@ -281,19 +307,17 @@ def test_gfx942_requires_signed_in_place_scorers(monkeypatch):
     ):
         pass
 
-    def dense_only(q, *a, relu=True, **k):
+    def dense_only(q, *a, **k):
         pass
 
     def helper(*a, **k):
         pass
 
     fake = types.ModuleType("aiter.ops.flydsl")
-    fake.recommended_gfx942_fp4_longctx_config = helper
-    for name in indexer.GFX942_SCORERS:
-        setattr(fake, name, full)
     kernels = types.ModuleType("aiter.ops.flydsl.kernels.mqa_logits")
     kernels.pa_mqa_logits_fp4_prefill_gfx942 = types.ModuleType("prefill")
     kernels.pa_mqa_logits_fp4_prefill_gfx942.compute_varqlen_windows = helper
+    kernels.pa_mqa_logits_fp4_prefill_gfx942.compute_prefill_schedule = helper
     rowpack = types.ModuleType("rowpack")
     rowpack.flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942 = full
     rowpack.rowpack_prefill_inputs_gfx942 = helper
@@ -313,13 +337,11 @@ def test_gfx942_requires_signed_in_place_scorers(monkeypatch):
         return indexer.rocm_mxfp4_aiter_unavailable_reason("gfx942")
 
     assert reason() is None
-    for scorer in (relu_only, dense_only):
-        monkeypatch.setattr(fake, indexer.GFX942_SCORERS[1], scorer)
+    for scorer in (unscheduled, dense_only):
+        rowpack.flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942 = scorer
         assert reason() == indexer.AITER_GFX942_REQUIREMENT
-    monkeypatch.setattr(fake, indexer.GFX942_SCORERS[1], full)
-    rowpack.flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942 = dense_only
-    assert reason() == indexer.AITER_GFX942_REQUIREMENT
-    del kernels.pa_mqa_page_max_fp4_rowpack_prefill_gfx942
+    rowpack.flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942 = full
+    del kernels.pa_mqa_logits_fp4_prefill_gfx942.compute_prefill_schedule
     assert reason() == indexer.AITER_GFX942_REQUIREMENT
 
 

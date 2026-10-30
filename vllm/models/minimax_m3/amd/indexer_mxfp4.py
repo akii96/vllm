@@ -50,17 +50,19 @@ AITER_REQUIREMENT = (
     "needs an aiter with the MXFP4 FlyDSL ops (ROCm/aiter#7056, #7057, #7060 and #7061)"
 )
 AITER_GFX942_REQUIREMENT = (
-    "needs an aiter containing ROCm/aiter#7017 with signed (relu=False), "
-    "paged in-place (kv_page_stride) scorers and the row-packed prefill scorer"
+    "needs an aiter containing ROCm/aiter#7017 with the paged in-place "
+    "(kv_page_stride) row-packed page-max scorer taking a caller schedule "
+    "(cta_info)"
 )
-GFX942_SCORERS = (
-    "flydsl_pa_mqa_logits_fp4_gfx942",
-    "flydsl_pa_mqa_logits_fp4_gfx942_longctx",
+GFX942_ROWPACK_ARGS = (
+    "kv_page_stride",
+    "kv_scale_page_stride",
+    "kv_scale_offset",
+    "cta_info",
+    "total_ctas",
 )
-GFX942_ROWPACK_ARGS = ("kv_page_stride", "kv_scale_page_stride", "kv_scale_offset")
-GFX942_DECODE_ARGS = ("relu", *GFX942_ROWPACK_ARGS)
-# Decode bounds above this use AITER's split-context scorer.
-GFX942_LONGCTX_THRESHOLD = 65536
+# Tokens per CTA chunk of the row-packed scorer (64 per wave, 4 waves).
+GFX942_DECODE_BLOCK_K = 256
 
 
 def _mxfp4_arch() -> str | None:
@@ -91,17 +93,14 @@ def rocm_mxfp4_aiter_unavailable_reason(arch: str | None = None) -> str | None:
             from aiter.ops.msa_attention import pa_sparse_block_topk  # noqa: F401
 
             required = [
-                (getattr(flydsl, name), GFX942_DECODE_ARGS) for name in GFX942_SCORERS
-            ]
-            required.append(
                 (
                     rowpack.flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942,
                     GFX942_ROWPACK_ARGS,
                 )
-            )
+            ]
             for fn in (
-                flydsl.recommended_gfx942_fp4_longctx_config,
                 prefill.compute_varqlen_windows,
+                prefill.compute_prefill_schedule,
                 rowpack.rowpack_prefill_inputs_gfx942,
             ):
                 required.append((fn, ()))
@@ -244,10 +243,28 @@ def _pin_forced_blocks(
 @dataclass
 class Gfx942DecodePlan:
     """Per-step inputs shared by every gfx942 index layer, in persistent
-    buffers so a captured decode replays from stable addresses."""
+    buffers so a captured decode replays from stable addresses.
+
+    Decode runs AITER's row-packed page-max scorer: each request's
+    ``H * query_len`` (index head, MTP row) pairs fill one 16-slot MFMA group,
+    so a K tile is loaded and e2m1-decoded once per request rather than once
+    per row and head, and 64-token page maxima are reduced in-kernel instead of
+    round-tripping ``[rows, max_seq_len]`` fp32 logits through HBM.
+    """
 
     page64_table: torch.Tensor
-    scorer_kwargs: dict
+    # Row-packed scorer operands, refilled per layer by the Q pack kernel.
+    q_fp4: torch.Tensor  # [max_reqs, 16, 64] uint8
+    q_scale: torch.Tensor  # [max_reqs, 1, 4, 16, 4] uint8
+    slot_meta: torch.Tensor  # [3 * 16 * max_reqs] int32
+    group_to_batch: torch.Tensor  # [max_reqs] int32, arange
+    group_starts: torch.Tensor  # [max_reqs] int32, zeros
+    page_max: torch.Tensor  # [H * max_rows, 2 * width] fp32
+    # The schedule is built once per step (it depends only on seq_lens), not
+    # once per layer.
+    cta_info: torch.Tensor
+    num_ctas: int
+    block_k: int
 
 
 @dataclass
@@ -280,11 +297,20 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
         self._work_map_buf: torch.Tensor | None = None
         self.is_gfx942 = _mxfp4_arch() == "gfx942"
         self._page64_table: torch.Tensor | None = None
-        self._cta_info: dict[tuple[int, int], tuple[dict, torch.Tensor]] = {}
+        self._gfx942_buffers: dict[str, torch.Tensor] | None = None
+        hf = vllm_config.model_config.hf_text_config
+        sparse_cfg = getattr(hf, "sparse_attention_config", None) or {}
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        self._gfx942_index_heads = max(
+            1, sparse_cfg.get("sparse_num_index_heads", 1) // tp
+        )
 
     def _gfx942_decode_plan(
         self, d: MiniMaxM3IndexerDecodeMetadata
     ) -> Gfx942DecodePlan:
+        from .ops.mxfp4_gfx942 import (
+            KERNEL_HEADS as KERNEL_GROUP_ROWS,
+        )
         from .ops.mxfp4_gfx942 import (
             KERNEL_PAGES_PER_BLOCK,
             expand_block_table_page64_into,
@@ -301,34 +327,68 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
         table = expand_block_table_page64_into(
             d.block_table[:, :width], self._page64_table
         )
-        if d.max_seq_len <= GFX942_LONGCTX_THRESHOLD:
-            return Gfx942DecodePlan(table, {})
-        from aiter.ops.flydsl import recommended_gfx942_fp4_longctx_config
-        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_common import (
-            compute_varctx_schedule,
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill_gfx942 import (  # noqa: E501
+            CTA_INFO_WIDTH,
+            compute_prefill_schedule,
         )
 
-        key = (batch, d.decode_query_len)
-        if key not in self._cta_info:
-            cfg = recommended_gfx942_fp4_longctx_config(
-                d.max_seq_len, batch_size=batch, next_n=d.decode_query_len
-            )
-            self._cta_info[key] = (
-                cfg,
-                torch.empty(
-                    (cfg["parallel_unit_num"], 4), dtype=torch.int32, device=self.device
+        if self._gfx942_buffers is None:
+            reqs = self._max_decode_reqs
+            rows = reqs * self.max_decode_query_len
+            cus = torch.cuda.get_device_properties(self.device).multi_processor_count
+            # The scorer's default occupancy: four CTAs per CU.
+            num_ctas = max(4 * cus, reqs)
+            self._gfx942_buffers = dict(
+                q_fp4=torch.zeros(
+                    (reqs, KERNEL_GROUP_ROWS, 64), dtype=torch.uint8, device=self.device
+                ),
+                q_scale=torch.zeros(
+                    (reqs, 1, 4, KERNEL_GROUP_ROWS, 4),
+                    dtype=torch.uint8,
+                    device=self.device,
+                ),
+                slot_meta=torch.zeros(
+                    3 * KERNEL_GROUP_ROWS * reqs, dtype=torch.int32, device=self.device
+                ),
+                group_to_batch=torch.arange(
+                    reqs, dtype=torch.int32, device=self.device
+                ),
+                group_starts=torch.zeros(reqs, dtype=torch.int32, device=self.device),
+                # Never filled: every page of a row's causal blocks is written by
+                # the scorer, and nothing downstream reads past them.
+                page_max=torch.empty(
+                    (self._gfx942_index_heads * rows, KERNEL_PAGES_PER_BLOCK * width),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                cta_info=torch.empty(
+                    (num_ctas, CTA_INFO_WIDTH), dtype=torch.int32, device=self.device
                 ),
             )
-        cfg, cta_info = self._cta_info[key]
-        _, _, total = compute_varctx_schedule(
+        buf = self._gfx942_buffers
+        # One schedule per step, shared by every index layer. The grid is fixed
+        # at the buffer's CTA count, so a captured decode replays any batch.
+        _, cta_info, num_ctas = compute_prefill_schedule(
+            buf["group_to_batch"][:batch],
+            buf["group_starts"][:batch],
             d.seq_lens,
-            cfg["block_k"],
-            cfg["parallel_unit_num"],
+            GFX942_DECODE_BLOCK_K,
+            buf["cta_info"].shape[0],
             d.max_seq_len,
-            next_n=d.decode_query_len,
-            cta_info_out=cta_info,
+            cta_info_out=buf["cta_info"],
         )
-        return Gfx942DecodePlan(table, dict(cfg, cta_info=cta_info, total_ctas=total))
+        return Gfx942DecodePlan(
+            page64_table=table,
+            q_fp4=buf["q_fp4"],
+            q_scale=buf["q_scale"],
+            slot_meta=buf["slot_meta"],
+            group_to_batch=buf["group_to_batch"],
+            group_starts=buf["group_starts"],
+            page_max=buf["page_max"],
+            cta_info=cta_info,
+            num_ctas=num_ctas,
+            block_k=GFX942_DECODE_BLOCK_K,
+        )
 
     def _work_map_buffer(self) -> torch.Tensor:
         if self._work_map_buf is None:
@@ -457,69 +517,62 @@ def mxfp4_gfx942_index_scores_decode(
     init_blocks: int,
     local_blocks: int,
 ) -> torch.Tensor:
-    """Pinned signed block scores of the decode rows."""
-    from aiter.ops.flydsl import (
-        flydsl_pa_mqa_logits_fp4_gfx942,
-        flydsl_pa_mqa_logits_fp4_gfx942_longctx,
+    """Pinned signed block scores of the decode rows.
+
+    One row-packed scorer launch covers every index head and MTP row of the
+    batch (see :class:`Gfx942DecodePlan`), then one pass folds its 64-token
+    page maxima into pinned 128-token block scores.
+    """
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_page_max_fp4_rowpack_prefill_gfx942 import (  # noqa: E501
+        flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942,
     )
 
     from .ops.mxfp4_gfx942 import (
-        decode_block_scores_gfx942,
+        decode_page_max_to_block_scores_gfx942,
         gfx942_mxfp4_cache_strides,
-        quantize_q_gfx942,
+        pack_decode_rows_gfx942,
     )
 
-    long_ctx = bool(plan.scorer_kwargs)
-    scorer = (
-        flydsl_pa_mqa_logits_fp4_gfx942_longctx
-        if long_ctx
-        else flydsl_pa_mqa_logits_fp4_gfx942
-    )
     batch, (rows, heads) = seq_lens.shape[0], index_query.shape[:2]
     k, k_scale, cache_kw = gfx942_mxfp4_cache_strides(index_pages)
+    slot_meta = pack_decode_rows_gfx942(
+        index_query,
+        seq_lens,
+        plan.q_fp4,
+        plan.q_scale,
+        plan.slot_meta,
+        query_len=query_len,
+    )
+    page_max = plan.page_max[: heads * rows]
+    flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942(
+        plan.q_fp4[:batch],
+        plan.q_scale[:batch],
+        k,
+        k_scale,
+        plan.page64_table,
+        slot_meta,
+        plan.group_to_batch[:batch],
+        plan.group_starts[:batch],
+        seq_lens,
+        max_seq_len,
+        page_max,
+        weight_scale=scale,
+        block_k=plan.block_k,
+        cta_info=plan.cta_info,
+        total_ctas=plan.num_ctas,
+        **cache_kw,
+    )
     score = _new_score(heads, rows, max_seq_len, index_query.device)
-    for head in range(heads):
-        q, q_scale, weights = quantize_q_gfx942(index_query, head)
-        long_kwargs = {}
-        if long_ctx:
-            # A caller-built schedule leaves the -inf fill to the caller; the
-            # host-side Q-scale check cannot run inside a captured decode.
-            long_kwargs = dict(
-                plan.scorer_kwargs,
-                validate_q_scale=False,
-                out=torch.full(
-                    (rows, max_seq_len),
-                    float("-inf"),
-                    dtype=torch.float32,
-                    device=index_query.device,
-                ),
-            )
-        logits = scorer(
-            q.view(batch, query_len, *q.shape[1:]),
-            q_scale.view(batch, query_len, *q_scale.shape[1:]),
-            k,
-            k_scale,
-            plan.page64_table,
-            weights,
-            seq_lens,
-            max_seq_len,
-            weight_scale=scale,
-            next_n=query_len,
-            kv_block_size=64,
-            relu=False,
-            **cache_kw,
-            **long_kwargs,
-        )
-        decode_block_scores_gfx942(
-            logits,
-            seq_lens,
-            score[head],
-            query_len=query_len,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            sentinel_init=SENTINEL_INIT,
-            sentinel_local=SENTINEL_LOCAL,
-        )
+    decode_page_max_to_block_scores_gfx942(
+        page_max.view(heads, rows, -1),
+        seq_lens,
+        score,
+        query_len=query_len,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        sentinel_init=SENTINEL_INIT,
+        sentinel_local=SENTINEL_LOCAL,
+    )
     return score
 
 
