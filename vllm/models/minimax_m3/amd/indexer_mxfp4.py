@@ -555,6 +555,7 @@ class MiniMaxM3IndexerMxfp4MetadataBuilder(MiniMaxM3IndexerMSAMetadataBuilder):
             self.is_gfx942
             and metadata.prefill is not None
             and not os.environ.get("VLLM_MINIMAX_M3_GFX942_UNPLANNED_PREFILL")
+            and os.environ.get("VLLM_MINIMAX_M3_GFX942_FP8COPY_PREFILL", "1") != "1"
         ):
             prefill_plan = self._gfx942_prefill_plan(metadata)
         d = metadata.decode
@@ -1231,7 +1232,7 @@ class MiniMaxM3IndexerRocmMxfp4Impl(MiniMaxM3IndexerImpl):
                 assert page16 is not None
                 assert md.prefill_row_req_id is not None
                 assert md.prefill_kv_lens is not None
-                if os.environ.get("VLLM_MINIMAX_M3_GFX942_FP8COPY_PREFILL") == "1":
+                if os.environ.get("VLLM_MINIMAX_M3_GFX942_FP8COPY_PREFILL", "1") == "1":
                     score = mxfp4_gfx942_index_scores_prefill_fp8copy(
                         iq[nd:],
                         pages,
