@@ -76,7 +76,7 @@ def gfx942_fp8q_decode_enabled() -> bool:
     indexer does, instead of an MXFP4 Q. Same MFMA, no Q e2m1 decode, and the
     MXFP4 Q rounding (the dominant top-k recall loss) is gone. Needs an aiter
     whose row-packed scorer takes ``q_fp8``; otherwise stays on MXFP4 Q."""
-    if os.environ.get("VLLM_MINIMAX_M3_GFX942_FP8Q_DECODE", "0") != "1":
+    if os.environ.get("VLLM_MINIMAX_M3_GFX942_FP8Q_DECODE", "1") != "1":
         return False
     return _aiter_rowpack_has_fp8q()
 
