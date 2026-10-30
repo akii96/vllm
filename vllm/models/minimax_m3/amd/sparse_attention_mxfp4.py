@@ -47,6 +47,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 )
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
@@ -277,16 +278,39 @@ class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
         )
         q = query[:num_tokens].view(-1, self.num_heads, self.head_size)
         out = output[:num_tokens].view(-1, self.num_heads, self.head_size)
-        mxfp4_sparse_attend_gfx942(
-            q,
-            kv_cache,
-            sparse_bt[: num_tokens * kvh],
-            sparse_ctx[: num_tokens * kvh],
-            out,
-            self.scale,
+        common = dict(
             num_kv_heads=kvh,
             max_blocks=self.topk_blocks,
             bt_col_stride=PAGE16_PER_BLOCK,
             page_div=PAGE16_PER_BLOCK * kvh,
         )
+        nd = md.num_decode_tokens
+        p = md.prefill
+        if p is None or not self._dequant_prefill_once(md):
+            mxfp4_sparse_attend_gfx942(
+                q, kv_cache, sparse_bt[: num_tokens * kvh],
+                sparse_ctx[: num_tokens * kvh], out, self.scale, **common,
+            )  # fmt: skip
+            return output
+        if nd > 0:
+            mxfp4_sparse_attend_gfx942(
+                q[:nd], kv_cache, sparse_bt[: nd * kvh], sparse_ctx[: nd * kvh],
+                out[:nd], self.scale, **common,
+            )  # fmt: skip
+        # Many prefill rows select the same blocks: decode every block of the
+        # prefill requests once to bf16 instead of once per selecting row.
+        mxfp4_sparse_attend_gfx942(
+            q[nd:], kv_cache, sparse_bt[nd * kvh : num_tokens * kvh],
+            sparse_ctx[nd * kvh : num_tokens * kvh], out[nd:], self.scale,
+            prefill_block_table=p.block_table, prefill_seq_lens=p.seq_lens,
+            prefill_max_seq_len=p.max_seq_len, **common,
+        )  # fmt: skip
         return output
+
+    def _dequant_prefill_once(self, md: MiniMaxM3SparseMetadata) -> bool:
+        """Whether the prefill rows select more blocks than their requests
+        hold, so that decoding each block once is the cheaper way round."""
+        p = md.prefill
+        assert p is not None
+        blocks = p.block_table.shape[0] * cdiv(p.max_seq_len, PAGE_TOKENS)
+        return md.num_prefill_tokens * self.topk_blocks > 2 * blocks

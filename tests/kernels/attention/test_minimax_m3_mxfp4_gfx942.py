@@ -177,3 +177,25 @@ def test_sparse_attend_page16_table():
     )
     ref = _reference(q, cache, table, ctx, H)
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+def test_sparse_attend_prefill_dequant_once(num_kv_heads):
+    """Dequantizing every request block once to bf16 first gives the same
+    attention as decoding per row (the dequantization is exact)."""
+    H = num_kv_heads
+    causal_lens = [300, 2048, 5000, 129]
+    rows = len(causal_lens)
+    num_pages = 64
+    cache, table, ctx, q = _case(rows, H, causal_lens, num_pages, seed=11)
+    # Two requests that between them own every page.
+    block_table = torch.randperm(num_pages, device="cuda").int().view(2, 32)
+    seq_lens = torch.full((2,), 32 * BLOCK, dtype=torch.int32, device="cuda")
+    out = torch.empty_like(q)
+    mxfp4_sparse_attend_gfx942(
+        q, cache, table, ctx, out, SCALE, num_kv_heads=H, max_blocks=TOPK,
+        prefill_block_table=block_table, prefill_seq_lens=seq_lens,
+        prefill_max_seq_len=32 * BLOCK,
+    )
+    ref = _reference(q, cache, table, ctx, H)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
