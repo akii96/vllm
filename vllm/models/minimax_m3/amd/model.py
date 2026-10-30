@@ -1288,7 +1288,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
             return qkv.new_zeros((num_tokens, self.hidden_size))
 
-        if _USE_GFX942_NATIVE_QKNORM_ROPE:
+        # gfx942 MXFP4 K/V: the fused HIP insert writes gfx950's packed fp4 with
+        # OCP converts, so the K/V pages are written by the native path.
+        if _USE_GFX942_NATIVE_QKNORM_ROPE or (self.use_mxfp4_kv and on_gfx942()):
             q, index_q = self._native_gfx942_qknorm_rope_cache(
                 qkv, positions, fwd_slot_mapping
             )
