@@ -16,6 +16,9 @@ gfx942 MXFP4 indexer's top-k emits, read in place.
 from dataclasses import replace
 from typing import ClassVar
 
+import functools
+import os
+
 import torch
 
 from vllm.config.cache import CacheDType
@@ -183,6 +186,21 @@ def mxfp4_sparse_attend(
     )
 
 
+@functools.cache
+def _aiter_mxfp4_decode():
+    """AITER's gluon MXFP4 sparse paged-attention decode, if this AITER has it
+    (``VLLM_ROCM_MXFP4_TRITON_DECODE=1`` keeps the Triton attend)."""
+    if os.environ.get("VLLM_ROCM_MXFP4_TRITON_DECODE", "0") == "1":
+        return None
+    try:
+        from aiter.ops.triton.gluon.pa_decode_mxfp4_gluon import (
+            pa_decode_mxfp4_gluon,
+        )
+    except ImportError:
+        return None
+    return pa_decode_mxfp4_gluon
+
+
 class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
     """MXFP4 sparse attend over the pages each query token's top-k selects."""
 
@@ -316,12 +334,23 @@ class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
             ):  # fmt: skip
                 num_tokens = nd
         if num_tokens > 0:
-            mxfp4_sparse_attend_gfx942(
-                q[:num_tokens], kv_cache, sparse_bt[: num_tokens * kvh],
-                sparse_ctx[: num_tokens * kvh], out[:num_tokens], self.scale,
-                **common,
-            )  # fmt: skip
+            pa_decode_mxfp4 = _aiter_mxfp4_decode()
+            if pa_decode_mxfp4 is not None and q.dtype == torch.bfloat16:
+                # AITER's gluon MXFP4 decode: e2m1 decoded to e4m3fnuz in
+                # registers and fp8 MFMAs, per-token power-of-two scales.
+                pa_decode_mxfp4(
+                    out[:num_tokens], q[:num_tokens], kv_cache,
+                    sparse_ctx[: num_tokens * kvh], sparse_bt[: num_tokens * kvh],
+                    self.scale, kvh,
+                )  # fmt: skip
+            else:
+                mxfp4_sparse_attend_gfx942(
+                    q[:num_tokens], kv_cache, sparse_bt[: num_tokens * kvh],
+                    sparse_ctx[: num_tokens * kvh], out[:num_tokens], self.scale,
+                    **common,
+                )  # fmt: skip
         return output
+
     def _transcode_prefill_once(self, md: MiniMaxM3SparseMetadata) -> bool:
         """Whether the prefill rows select more blocks than their requests
         hold, so that transcoding each block once is the cheaper way round."""
