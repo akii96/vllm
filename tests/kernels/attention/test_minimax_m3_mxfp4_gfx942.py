@@ -227,3 +227,44 @@ def test_sparse_attend_prefill_gluon(num_kv_heads):
     )
     ref = _reference(q, cache, table, ctx, H)
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+def test_prefill_fp8_transcode(num_kv_heads):
+    """The fp8 transcode is exact (per-token power-of-two scales, every chunk
+    within 9 binades of the token's largest) and AITER's fp8 sparse paged
+    attention over it tracks fp32 attention over the MXFP4 pages to fp8
+    compute (fp8 Q and P) accuracy."""
+    from vllm.models.minimax_m3.amd.ops.mxfp4_attn_gfx942 import (
+        Mxfp4PrefillScratch,
+        mxfp4_sparse_attend_prefill_fp8_gfx942,
+    )
+
+    H = num_kv_heads
+    causal_lens = [300, 2048, 5000, 129]
+    rows = len(causal_lens)
+    num_pages = 64
+    cache, table, ctx, q = _case(rows, H, causal_lens, num_pages, seed=17)
+    block_table = torch.randperm(num_pages, device="cuda").int().view(2, 32)
+    seq_lens = torch.full((2,), 32 * BLOCK, dtype=torch.int32, device="cuda")
+    j = torch.arange(8, device="cuda", dtype=torch.int32)
+    page16 = torch.zeros(rows * H, TOPK * 8, dtype=torch.int32, device="cuda")
+    for row in range(rows * H):
+        page16[row] = ((table[row, :, None] * 8 + j) * H + row % H).flatten()
+    scratch = Mxfp4PrefillScratch(num_pages, H, torch.device("cuda"))
+    out = torch.empty_like(q)
+    assert mxfp4_sparse_attend_prefill_fp8_gfx942(
+        q, cache, page16, ctx, out, SCALE, num_kv_heads=H,
+        block_table=block_table, seq_lens=seq_lens, max_seq_len=32 * BLOCK,
+        scratch=scratch,
+    )
+    ref = _reference(q, cache, table, ctx, H)
+    err = (out.float() - ref).norm() / ref.norm()
+    assert err < 0.08, err
+    # Too small a scratch declines rather than overrunning.
+    small = Mxfp4PrefillScratch(8, H, torch.device("cuda"))
+    assert not mxfp4_sparse_attend_prefill_fp8_gfx942(
+        q, cache, page16, ctx, out, SCALE, num_kv_heads=H,
+        block_table=block_table, seq_lens=seq_lens, max_seq_len=32 * BLOCK,
+        scratch=small,
+    )

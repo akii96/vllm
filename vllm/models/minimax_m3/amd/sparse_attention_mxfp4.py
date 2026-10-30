@@ -194,6 +194,21 @@ class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
         if reason is not None:
             raise ValueError(f"MiniMax M3 MXFP4 KV cache on ROCm {reason}")
         self.is_gfx942 = _mxfp4_attention_arch() == "gfx942"
+        self.prefill_scratch = None
+        if self.is_gfx942:
+            from vllm.config import get_current_vllm_config
+            from vllm.models.minimax_m3.amd.ops.mxfp4_attn_gfx942 import (
+                Mxfp4PrefillScratch,
+            )
+
+            # One scratch per device, made here so the memory profile charges
+            # it: room for two max-length prefill requests per step.
+            max_len = get_current_vllm_config().model_config.max_model_len
+            self.prefill_scratch = Mxfp4PrefillScratch.get(
+                2 * cdiv(max_len, PAGE_TOKENS),
+                self.num_kv_heads,
+                torch.device("cuda", torch.cuda.current_device()),
+            )
 
     def forward(
         self,
@@ -267,7 +282,7 @@ class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
         """
         from vllm.models.minimax_m3.amd.ops.mxfp4_attn_gfx942 import (
             mxfp4_sparse_attend_gfx942,
-            mxfp4_sparse_attend_prefill_gfx942,
+            mxfp4_sparse_attend_prefill_fp8_gfx942,
         )
 
         num_tokens = md.num_actual_tokens
@@ -287,31 +302,29 @@ class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
         )
         nd = md.num_decode_tokens
         p = md.prefill
-        if p is None or not self._dequant_prefill_once(md):
+        if p is not None and self._transcode_prefill_once(md):
+            # Many prefill rows select the same blocks: transcode every block
+            # of the prefill requests once to fp8 page-16 pages with per-token
+            # power-of-two scales and run AITER's sparse paged attention in
+            # fp8, the kernel the fp8 K/V cache uses.
+            assert self.prefill_scratch is not None
+            if mxfp4_sparse_attend_prefill_fp8_gfx942(
+                q[nd:], kv_cache, sparse_bt[nd * kvh : num_tokens * kvh],
+                sparse_ctx[nd * kvh : num_tokens * kvh], out[nd:], self.scale,
+                num_kv_heads=kvh, block_table=p.block_table, seq_lens=p.seq_lens,
+                max_seq_len=p.max_seq_len, scratch=self.prefill_scratch,
+            ):  # fmt: skip
+                num_tokens = nd
+        if num_tokens > 0:
             mxfp4_sparse_attend_gfx942(
-                q, kv_cache, sparse_bt[: num_tokens * kvh],
-                sparse_ctx[: num_tokens * kvh], out, self.scale, **common,
+                q[:num_tokens], kv_cache, sparse_bt[: num_tokens * kvh],
+                sparse_ctx[: num_tokens * kvh], out[:num_tokens], self.scale,
+                **common,
             )  # fmt: skip
-            return output
-        if nd > 0:
-            mxfp4_sparse_attend_gfx942(
-                q[:nd], kv_cache, sparse_bt[: nd * kvh], sparse_ctx[: nd * kvh],
-                out[:nd], self.scale, **common,
-            )  # fmt: skip
-        # Many prefill rows select the same blocks: decode every block of the
-        # prefill requests once (exactly) to bf16 in AITER's page-16 layout and
-        # run AITER's sparse paged attention over it, as the fp8 cache does.
-        mxfp4_sparse_attend_prefill_gfx942(
-            q[nd:], kv_cache, sparse_bt[nd * kvh : num_tokens * kvh],
-            sparse_ctx[nd * kvh : num_tokens * kvh], out[nd:], self.scale,
-            num_kv_heads=kvh, block_table=p.block_table, seq_lens=p.seq_lens,
-            max_seq_len=p.max_seq_len,
-        )  # fmt: skip
         return output
-
-    def _dequant_prefill_once(self, md: MiniMaxM3SparseMetadata) -> bool:
+    def _transcode_prefill_once(self, md: MiniMaxM3SparseMetadata) -> bool:
         """Whether the prefill rows select more blocks than their requests
-        hold, so that decoding each block once is the cheaper way round."""
+        hold, so that transcoding each block once is the cheaper way round."""
         p = md.prefill
         assert p is not None
         blocks = p.block_table.shape[0] * cdiv(p.max_seq_len, PAGE_TOKENS)
