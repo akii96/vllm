@@ -81,6 +81,36 @@ def gfx942_fp8q_decode_enabled() -> bool:
     return _aiter_rowpack_has_fp8q()
 
 
+def gfx942_decode_fuse_level() -> int:
+    """``VLLM_MINIMAX_M3_GFX942_DECODE_FUSE`` (FP8-Q decode only): 0 runs the
+    pack / scorer / page-max fold as three launches; 1 folds the 128-token
+    block scores and init/local pinning into the scorer's epilogue; 2
+    (default) also packs Q and the slot metadata in the scorer's prologue, so
+    the scores take one launch. Same results at every level. Falls back to 0
+    on an aiter without the block-score scorer."""
+    level = int(os.environ.get("VLLM_MINIMAX_M3_GFX942_DECODE_FUSE", "2"))
+    if level <= 0 or not _aiter_rowpack_has_block_out():
+        return 0
+    return min(level, 2)
+
+
+_BLOCK_OUT_SUPPORT: list[bool] = []
+
+
+def _aiter_rowpack_has_block_out() -> bool:
+    if not _BLOCK_OUT_SUPPORT:
+        try:
+            from aiter.ops.flydsl.kernels.mqa_logits import (
+                pa_mqa_page_max_fp4_rowpack_prefill_gfx942 as rowpack,
+            )
+
+            ok = hasattr(rowpack, "compile_pa_mqa_block_score_fp4_rowpack_decode_gfx942")
+        except ImportError:
+            ok = False
+        _BLOCK_OUT_SUPPORT.append(ok)
+    return _BLOCK_OUT_SUPPORT[0]
+
+
 _FP8Q_SUPPORT: list[bool] = []
 
 
@@ -742,8 +772,14 @@ def mxfp4_gfx942_index_scores_decode(
     init_blocks: int,
     local_blocks: int,
     q_fp8: bool | None = None,
+    fuse: int | None = None,
 ) -> torch.Tensor:
     """Pinned signed block scores of the decode rows.
+
+    FP8-Q with ``fuse`` (default :func:`gfx942_decode_fuse_level`) >= 1 writes
+    pinned block scores straight from the scorer's epilogue (no page-max
+    fold launch); >= 2 also packs Q and the slot metadata in its prologue (no
+    pack launch). Results are bit-identical to ``fuse=0``.
 
     One row-packed scorer launch covers every index head and MTP row of the
     batch (see :class:`Gfx942DecodePlan`), then one pass folds its 64-token
@@ -767,6 +803,22 @@ def mxfp4_gfx942_index_scores_decode(
     q_fp8 = q_fp8 and plan.q_fp8 is not None
     batch, (rows, heads) = seq_lens.shape[0], index_query.shape[:2]
     k, k_scale, cache_kw = gfx942_mxfp4_cache_strides(index_pages)
+    fuse = gfx942_decode_fuse_level() if fuse is None else fuse
+    if q_fp8 and fuse > 0 and batch:
+        return _mxfp4_gfx942_index_scores_decode_fused(
+            index_query,
+            seq_lens,
+            plan,
+            k,
+            k_scale,
+            cache_kw,
+            max_seq_len=max_seq_len,
+            query_len=query_len,
+            scale=scale,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            fuse_q=fuse >= 2,
+        )
     if q_fp8:
         assert plan.q_scale_f32 is not None
         q_buf, qs_buf = plan.q_fp8, plan.q_scale_f32
@@ -820,6 +872,99 @@ def mxfp4_gfx942_index_scores_decode(
         local_blocks=local_blocks,
         sentinel_init=SENTINEL_INIT,
         sentinel_local=SENTINEL_LOCAL,
+    )
+    return score
+
+
+def _mxfp4_gfx942_index_scores_decode_fused(
+    index_query: torch.Tensor,
+    seq_lens: torch.Tensor,
+    plan: Gfx942DecodePlan,
+    k: torch.Tensor,
+    k_scale: torch.Tensor,
+    cache_kw: dict,
+    *,
+    max_seq_len: int,
+    query_len: int,
+    scale: float,
+    init_blocks: int,
+    local_blocks: int,
+    fuse_q: bool,
+) -> torch.Tensor:
+    """FP8-Q decode scores in one (``fuse_q``) or two launches: the scorer
+    writes pinned 128-token block scores directly (see
+    ``compile_pa_mqa_block_score_fp4_rowpack_decode_gfx942``)."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_page_max_fp4_rowpack_prefill_gfx942 import (  # noqa: E501
+        compile_pa_mqa_block_score_fp4_rowpack_decode_gfx942,
+    )
+
+    from .ops.mxfp4_gfx942 import KERNEL_HEADS, pack_decode_rows_fp8_gfx942
+
+    batch, (rows, heads) = seq_lens.shape[0], index_query.shape[:2]
+    assert plan.q_fp8 is not None and plan.q_scale_f32 is not None
+    if heads * query_len > KERNEL_HEADS:
+        raise ValueError(
+            f"{heads} index heads x {query_len} decode rows exceed the "
+            f"{KERNEL_HEADS}-slot MFMA group"
+        )
+    if fuse_q:
+        if index_query.dtype != torch.bfloat16 or index_query.stride(2) != 1:
+            fuse_q = False
+        elif index_query.stride(0) % 2 or index_query.stride(1) % 2:
+            fuse_q = False
+    if fuse_q:
+        q_arg, qs_arg, meta = index_query, plan.q_scale_f32[:batch], plan.slot_meta
+        q_strides = (index_query.stride(0), index_query.stride(1))
+    else:
+        q_arg, qs_arg = plan.q_fp8[:batch], plan.q_scale_f32[:batch]
+        meta = pack_decode_rows_fp8_gfx942(
+            index_query,
+            seq_lens,
+            plan.q_fp8,
+            plan.q_scale_f32,
+            plan.slot_meta,
+            query_len=query_len,
+        )
+        q_strides = (0, 0)
+    score = _new_score(heads, rows, max_seq_len, index_query.device)
+    out2d = score.view(heads * rows, score.shape[2])
+    launcher, _ = compile_pa_mqa_block_score_fp4_rowpack_decode_gfx942(
+        block_k=plan.block_k,
+        max_blocks_per_seq=plan.page64_table.shape[1],
+        head_dim=index_query.shape[-1],
+        kv_page_stride=cache_kw["kv_page_stride"],
+        kv_scale_page_stride=cache_kw["kv_scale_page_stride"],
+        kv_scale_offset=cache_kw["kv_scale_offset"],
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        sentinel_init=SENTINEL_INIT,
+        sentinel_local=SENTINEL_LOCAL,
+        fused_q_heads=heads if fuse_q else 0,
+        fused_q_len=query_len if fuse_q else 1,
+    )
+    _launch_rowpack_cached(
+        launcher,
+        (
+            out2d,
+            q_arg,
+            qs_arg,
+            k,
+            k_scale,
+            plan.page64_table,
+            meta,
+            plan.cta_info,
+            out2d.stride(0),
+            out2d.shape[1],
+            batch * KERNEL_HEADS,
+            out2d.numel(),
+            float(scale),
+            seq_lens,
+            q_strides[0],
+            q_strides[1],
+            rows,
+            plan.num_ctas,
+            torch.cuda.current_stream(),
+        ),
     )
     return score
 
