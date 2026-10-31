@@ -213,9 +213,13 @@ class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
             raise ValueError(f"MiniMax M3 MXFP4 KV cache on ROCm {reason}")
         self.is_gfx942 = _mxfp4_attention_arch() == "gfx942"
         self.prefill_scratch = None
-        # VLLM_MXFP4_KVP_PER_TOKEN=1: the older per-token-scale prefill attend.
+        # Per-token scales (exact transcode, AITER's per-token KV mode) by
+        # default. VLLM_MXFP4_KVP_SHARED_SCALE=1 opts into one power-of-two
+        # scale per side (still exact K/V, with a device-checked fallback),
+        # which runs AITER's faster per-tensor mode but quantizes P like the
+        # fp8 K/V path does.
         self.prefill_per_token_scales = (
-            os.environ.get("VLLM_MXFP4_KVP_PER_TOKEN", "0") == "1"
+            os.environ.get("VLLM_MXFP4_KVP_SHARED_SCALE", "0") != "1"
         )
         if self.is_gfx942:
             from vllm.config import get_current_vllm_config
