@@ -606,3 +606,133 @@ def test_mxfp4_decode_work_map_is_graph_stable(monkeypatch):
     assert calls[0][0] is calls[1][0] is builder._work_map_buf
     assert calls[0][1] == calls[1][1] == 4096 // 128
     assert first.decode.max_seq_len == second.decode.max_seq_len == 4096
+
+
+@requires_gpu_aiter
+@pytest.mark.parametrize("heads,query_len", [(2, 4), (1, 1), (2, 3)])
+def test_gfx942_fused_decode_matches_unfused(heads, query_len):
+    """VLLM_MINIMAX_M3_GFX942_DECODE_FUSE 1 / 2 (block scores from the
+    scorer's epilogue; Q pack in its prologue) reproduce the 3-launch FP8-Q
+    chain bit for bit on every causal block, init/local pins included."""
+    import types
+
+    from vllm.models.minimax_m3.amd import indexer_mxfp4 as M
+
+    if not (M._aiter_rowpack_has_fp8q() and M._aiter_rowpack_has_block_out()):
+        pytest.skip("aiter row-packed scorer lacks the fused decode variant")
+    torch.manual_seed(0)
+    batch, msl = 3, 4096
+    blocks = msl // 128
+    bt = torch.randperm(batch * blocks, device="cuda").view(batch, blocks)
+    bt = bt.to(torch.int32)
+    cache = torch.zeros(
+        (batch * blocks, MANAGER_BLOCK_BYTES), dtype=torch.uint8, device="cuda"
+    )
+    for b in range(batch):
+        k = torch.randn(msl, 128, device="cuda").to(torch.bfloat16)
+        slots = bt[b].long()[:, None] * 128 + torch.arange(128, device="cuda")
+        store_k_gfx942(k, cache, slots.flatten())
+    seq_lens = torch.tensor([4000, 517, 129], dtype=torch.int32, device="cuda")
+    iq = torch.randn(batch * query_len, heads, 128, device="cuda").to(torch.bfloat16)
+    fake = types.SimpleNamespace(
+        max_model_len=msl,
+        sparse_block_size=128,
+        _page64_table=None,
+        _max_decode_reqs=batch,
+        device=torch.device("cuda"),
+        _gfx942_buffers=None,
+        _gfx942_index_heads=heads,
+        max_decode_query_len=query_len,
+    )
+    d = types.SimpleNamespace(
+        seq_lens=seq_lens, block_table=bt, max_seq_len=msl, decode_query_len=query_len
+    )
+    plan = M.MiniMaxM3IndexerMxfp4MetadataBuilder._gfx942_decode_plan(fake, d)
+    out = {}
+    for fuse in (0, 1, 2):
+        out[fuse] = M.mxfp4_gfx942_index_scores_decode(
+            iq,
+            cache.view(-1, PAGE_BYTES),
+            seq_lens,
+            plan,
+            max_seq_len=msl,
+            query_len=query_len,
+            scale=128**-0.5,
+            init_blocks=1,
+            local_blocks=2,
+            q_fp8=True,
+            fuse=fuse,
+        ).clone()
+    for b in range(batch):
+        for r in range(query_len):
+            nb = (int(seq_lens[b]) - query_len + r + 1 + 127) // 128
+            row = b * query_len + r
+            for fuse in (1, 2):
+                assert torch.equal(
+                    out[fuse][:, row, :nb].view(torch.int32),
+                    out[0][:, row, :nb].view(torch.int32),
+                ), (fuse, b, r)
+
+
+@requires_gpu_aiter
+def test_gfx942_rowpack_call_cache_does_not_grow_or_pin_tensors():
+    """The resolved-launch cache is keyed on the specialization, not on data
+    pointers: decode steps with fresh activations / outputs at the same shapes
+    reuse one entry and leave no tensor alive (keying on data_ptr and holding
+    the bound args leaked device memory per step until launches failed with
+    hipErrorLaunchOutOfResources mid-serve)."""
+    import gc
+    import types
+    import weakref
+
+    from vllm.models.minimax_m3.amd import indexer_mxfp4 as M
+
+    if not (M._aiter_rowpack_has_fp8q() and M._aiter_rowpack_has_block_out()):
+        pytest.skip("aiter row-packed scorer lacks the fused decode variant")
+    torch.manual_seed(0)
+    batch, ql, heads, msl = 2, 4, 2, 2048
+    blocks = msl // 128
+    bt = torch.arange(batch * blocks, dtype=torch.int32, device="cuda").view(batch, -1)
+    cache = torch.zeros(
+        (batch * blocks, MANAGER_BLOCK_BYTES), dtype=torch.uint8, device="cuda"
+    )
+    seq_lens = torch.tensor([2000, 700], dtype=torch.int32, device="cuda")
+    fake = types.SimpleNamespace(
+        max_model_len=msl,
+        sparse_block_size=128,
+        _page64_table=None,
+        _max_decode_reqs=batch,
+        device=torch.device("cuda"),
+        _gfx942_buffers=None,
+        _gfx942_index_heads=heads,
+        max_decode_query_len=ql,
+    )
+    d = types.SimpleNamespace(
+        seq_lens=seq_lens, block_table=bt, max_seq_len=msl, decode_query_len=ql
+    )
+    plan = M.MiniMaxM3IndexerMxfp4MetadataBuilder._gfx942_decode_plan(fake, d)
+    for fuse in (0, 1, 2):
+        refs = []
+        for step in range(6):
+            iq = torch.randn(batch * ql, heads, 128, device="cuda").to(torch.bfloat16)
+            score = M.mxfp4_gfx942_index_scores_decode(
+                iq,
+                cache.view(-1, PAGE_BYTES),
+                seq_lens,
+                plan,
+                max_seq_len=msl,
+                query_len=ql,
+                scale=128**-0.5,
+                init_blocks=0,
+                local_blocks=1,
+                q_fp8=True,
+                fuse=fuse,
+            )
+            refs += [weakref.ref(iq), weakref.ref(score)]
+            if step == 1:
+                entries = len(M._ROWPACK_CALLS)
+            del iq, score
+        torch.cuda.synchronize()
+        gc.collect()
+        assert len(M._ROWPACK_CALLS) == entries, fuse
+        assert all(r() is None for r in refs), fuse

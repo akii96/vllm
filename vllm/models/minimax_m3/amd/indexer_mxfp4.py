@@ -722,42 +722,53 @@ def mxfp4_index_topk_decode(
     )
 
 
-# (launcher, every pointer / scalar / stream the resolved call bakes in) ->
-# (FlyDSL CallState, resolved args). The decode indexer runs in the attention
-# layer's eager break, so each of the 60 layers pays the launcher's host-side
-# signature binding and cache-key build (~150 us) per step, more than the
-# kernel itself; a resolved CallState relaunches in ~10 us. Every operand of
-# the decode launch is a persistent buffer or the layer's index cache, so the
-# key set is small (layers x batch sizes) and stable.
-_ROWPACK_CALLS: dict[tuple, tuple] = {}
+# launcher + the specialization-relevant args -> FlyDSL CallState. The decode
+# indexer runs in the attention layer's eager break, so each of the 60 layers
+# pays the launcher's host-side signature binding and cache-key build (~150 us)
+# per step, more than the kernel itself; a resolved CallState relaunches in
+# ~10 us.
+#
+# The key holds no tensor and no data pointer: a CallState re-reads every
+# pointer from the args it is called with (FlyDSL's own fast path does the
+# same), so it is keyed on what the compiled specialization depends on only.
+# Keying on data_ptr and keeping the bound args alive leaked one entry, and the
+# tensors it references, per call once an operand is a per-step activation or
+# a fresh output (the fused decode scorer's index Q and score buffer): device
+# memory then runs out mid-serve (hipErrorLaunchOutOfResources).
+_ROWPACK_CALLS: dict[tuple, object] = {}
+
+
+def _rowpack_call_key(launcher, args: tuple) -> tuple:
+    return (id(launcher),) + tuple(
+        (a.dtype, tuple(a.shape), tuple(a.stride()))
+        if isinstance(a, torch.Tensor)
+        else ("stream" if isinstance(a, torch.cuda.Stream) else a)
+        for a in args
+    )
 
 
 def _launch_rowpack_cached(launcher, args: tuple) -> None:
-    key = (id(launcher),) + tuple(
-        (a.data_ptr(), tuple(a.shape), tuple(a.stride()))
-        if isinstance(a, torch.Tensor)
-        else (a.cuda_stream if isinstance(a, torch.cuda.Stream) else a)
-        for a in args
-    )
-    hit = _ROWPACK_CALLS.get(key)
-    if hit is not None:
-        hit[0](hit[1])
+    key = _rowpack_call_key(launcher, args)
+    state = _ROWPACK_CALLS.get(key)
+    if state is not None:
+        state(args)
         return
     launcher(*args)  # compiles on first use and populates the CallState cache
     try:
         bound = launcher._sig.bind(*args)
         bound.apply_defaults()
+        if len(bound.arguments) != len(args):
+            raise TypeError("launcher has defaulted parameters")
         cache_key = launcher._build_full_cache_key(
             bound.arguments,
             owner_cls=None,
             bound_self=None,
             effective_hints=launcher._effective_compile_hints(),
         )
-        state = launcher._call_state_cache[cache_key]
-        _ROWPACK_CALLS[key] = (state, tuple(bound.arguments.values()))
+        _ROWPACK_CALLS[key] = launcher._call_state_cache[cache_key]
     except (AttributeError, KeyError, TypeError):
         # A FlyDSL without these internals: stay on the public launcher.
-        _ROWPACK_CALLS[key] = (lambda resolved: launcher(*args), None)
+        _ROWPACK_CALLS[key] = lambda a: launcher(*a)
 
 
 def mxfp4_gfx942_index_scores_decode(
