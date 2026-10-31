@@ -48,7 +48,7 @@ def launch_cached(
         return
     stream = torch.cuda.current_stream().cuda_stream
     key = (id(kernel), tuple(grid), stream, *kwargs.values()) + tuple(
-        (a.data_ptr(), a.shape, a.stride()) if isinstance(a, torch.Tensor) else a
+        (a.data_ptr(), a.dtype, a.shape, a.stride()) if isinstance(a, torch.Tensor) else a
         for a in args
     )
     hit = _CALLS.get(key)
