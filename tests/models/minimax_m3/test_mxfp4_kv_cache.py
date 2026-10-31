@@ -736,3 +736,61 @@ def test_gfx942_rowpack_call_cache_does_not_grow_or_pin_tensors():
         gc.collect()
         assert len(M._ROWPACK_CALLS) == entries, fuse
         assert all(r() is None for r in refs), fuse
+
+@requires_gpu_aiter
+def test_gfx942_prefill_planned_call_cache_stays_flat():
+    """Planned prefill steps build fresh plan tensors (q_fp4 / q_scale /
+    slot_meta / cta_info) every step; repeated steps of one shape must reuse
+    one resolved launch and free every per-step tensor."""
+    import gc
+    import types
+    import weakref
+
+    from vllm.models.minimax_m3.amd import indexer_mxfp4 as M
+
+    torch.manual_seed(0)
+    heads, chunk, prefix = 2, 300, 1000
+    ctx = prefix + chunk
+    blocks = 16
+    bt = torch.arange(blocks, dtype=torch.int32, device="cuda").view(1, -1)
+    cache = torch.zeros((blocks, MANAGER_BLOCK_BYTES), dtype=torch.uint8, device="cuda")
+    fake = types.SimpleNamespace(
+        _gfx942_index_heads=heads,
+        _prefill_page_max=None,
+        max_model_len=blocks * 128,
+        vllm_config=types.SimpleNamespace(
+            scheduler_config=types.SimpleNamespace(max_num_batched_tokens=chunk)
+        ),
+    )
+    p = types.SimpleNamespace(
+        cu_seqlens_q=torch.tensor([0, chunk], dtype=torch.int32, device="cuda"),
+        seq_lens=torch.tensor([ctx], dtype=torch.int32, device="cuda"),
+        block_table=bt,
+        max_seq_len=blocks * 128,
+    )
+    md = types.SimpleNamespace(prefill=p, num_prefill_tokens=chunk)
+    kv_lens = torch.arange(prefix + 1, ctx + 1, dtype=torch.int32, device="cuda")
+    refs, out = [], []
+    for step in range(5):
+        plan = M.MiniMaxM3IndexerMxfp4MetadataBuilder._gfx942_prefill_plan(fake, md)
+        iq = torch.randn(chunk, heads, 128, device="cuda").to(torch.bfloat16)
+        score = M.mxfp4_gfx942_index_scores_prefill_planned(
+            iq,
+            cache.view(-1, PAGE_BYTES),
+            kv_lens,
+            plan,
+            max_seq_len=p.max_seq_len,
+            scale=128**-0.5,
+            init_blocks=0,
+            local_blocks=1,
+        )
+        refs += [weakref.ref(t) for t in (iq, plan.q_fp4, plan.slot_meta, plan.cta_info)]
+        if step == 0:
+            entries = len(M._ROWPACK_CALLS)
+            torch.manual_seed(0)
+        out.append(score[:, :, :11].clone())
+        del plan, iq, score
+    torch.cuda.synchronize()
+    gc.collect()
+    assert len(M._ROWPACK_CALLS) == entries
+    assert all(r() is None for r in refs)
