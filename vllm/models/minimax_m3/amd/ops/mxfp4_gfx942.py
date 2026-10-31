@@ -53,13 +53,33 @@ def expand_block_table_page64_into(
         raise ValueError(
             f"page table {tuple(out.shape)} too small for {batch}x{blocks}"
         )
-    pages = out[:batch, : KERNEL_PAGES_PER_BLOCK * blocks]
-    for p in range(KERNEL_PAGES_PER_BLOCK):
-        col = pages[:, p::KERNEL_PAGES_PER_BLOCK]
-        torch.mul(block_table, KERNEL_PAGES_PER_BLOCK, out=col)
-        if p:
-            col.add_(p)
+    if batch and blocks:
+        # One launch (this runs on the host every decode step, outside the
+        # captured graph; the torch version was 3 launches, ~30 us).
+        BLOCK = 1024
+        _expand_page64_kernel[(batch, triton.cdiv(blocks, BLOCK))](
+            block_table,
+            out,
+            blocks,
+            block_table.stride(0),
+            out.stride(0),
+            PAGES=KERNEL_PAGES_PER_BLOCK,
+            BLOCK=BLOCK,
+            num_warps=4,
+        )
     return out[:batch]
+
+
+@triton.jit
+def _expand_page64_kernel(
+    bt_ptr, out_ptr, blocks, stride_bt, stride_out, PAGES: tl.constexpr, BLOCK: tl.constexpr
+):
+    b = tl.program_id(0)
+    j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = j < blocks
+    v = tl.load(bt_ptr + b.to(tl.int64) * stride_bt + j, mask=m, other=0)
+    for p in tl.static_range(PAGES):
+        tl.store(out_ptr + b.to(tl.int64) * stride_out + j * PAGES + p, v * PAGES + p, mask=m)
 
 
 def _check_cache(cache: torch.Tensor) -> torch.Tensor:
