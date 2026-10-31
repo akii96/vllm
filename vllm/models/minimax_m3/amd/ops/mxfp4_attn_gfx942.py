@@ -802,6 +802,7 @@ def _side_scale_max_kernel(
     bt_ptr,
     seq_lens_ptr,
     emax_ptr,
+    lossy_ptr,
     stride_cache_block,
     stride_bt,
     H: tl.constexpr,
@@ -810,10 +811,12 @@ def _side_scale_max_kernel(
     PAGE: tl.constexpr,
 ):
     """``emax[side] = max`` e8m0 over every block of the requests (atomic,
-    device-side: no host round trip)."""
+    device-side: no host round trip); clears the lossy flag."""
     i = tl.program_id(0)
     j = tl.program_id(1)
     side = tl.program_id(2)
+    if (i == 0) & (j == 0) & (side == 0):
+        tl.store(lossy_ptr, 0)
     seq_len = tl.load(seq_lens_ptr + i)
     if j * BLOCK_TOKENS >= seq_len:
         return
@@ -837,6 +840,7 @@ def _transcode_page16_fp8_scalar_kernel(
     v_out_ptr,
     kv_scale_ptr,
     emax_ptr,
+    lossy_ptr,
     map_ptr,
     stride_cache_block,
     stride_bt,
@@ -850,7 +854,9 @@ def _transcode_page16_fp8_scalar_kernel(
     """``_transcode_page16_fp8_kernel`` against one scale per side: block
     ``j`` of request ``i``, head slot ``side``, to e4m3fnuz page-16 pages at
     scratch slot ``i * width + j``; ``kv_scale[side >= H] = 2^(emax - 127 -
-    HEADROOM)`` and ``map[block] = slot``."""
+    HEADROOM)`` and ``map[block] = slot``. A nonzero value e4m3fnuz does not
+    hold exactly (a chunk more than 14 binades below ``emax``) sets
+    ``lossy``, and the caller redoes the call with per-token scales."""
     i = tl.program_id(0)
     j = tl.program_id(1)
     side = tl.program_id(2)
@@ -892,6 +898,9 @@ def _transcode_page16_fp8_scalar_kernel(
         # -0 stays +0: e4m3fnuz 0x80 is NaN.
         val = tl.where(((n & 8) != 0) & (m != 0), -mag, mag) * step
         q8 = val.to(tl.float8e4b8)
+        bad = tl.sum(((q8.to(tl.float32) != val) & (m != 0)).to(tl.int32))
+        if bad > 0:
+            tl.atomic_or(lossy_ptr, 1)
         if side < H:
             off = (
                 ((pg[:, None] * H + h) * (D // 16) + d[None, :] // 16) * 256
@@ -942,6 +951,9 @@ class Mxfp4PrefillScratch:
         # [K, V] largest e8m0 (zero between calls) and the scalar scales.
         self.emax = torch.zeros(2, dtype=torch.int32, device=device)
         self.kv_scale = torch.ones(2, dtype=torch.float32, device=device)
+        # Set by the shared-scale transcode when a value would not be exact.
+        self.lossy = torch.zeros(1, dtype=torch.int32, device=device)
+        self.fallbacks = 0
         self.partials: tuple | None = None
 
     def partials_for(self, shape, dtype, device):
@@ -1040,6 +1052,21 @@ def _gluon_sparse_pa_fp8_token_scales(
 _KVP_STATS = {"n": 0}
 
 
+def _deq_tokens(kv_cache, blk, jj, side, H, n, E2M1):
+    """fp32 K or V rows (head slot ``side``) of 16-token pages ``jj`` of
+    blocks ``blk``, first ``n`` tokens."""
+    pages = kv_cache.view(kv_cache.shape[0], 2 * H, PAGE_BYTES)[blk, side]
+    data = pages[:, : PAGE_TOKENS * HEAD_DIM // 2].view(-1, PAGE_TOKENS, HEAD_DIM // 2)
+    sc = pages[:, PAGE_TOKENS * HEAD_DIM // 2 :].view(-1, PAGE_TOKENS, HEAD_DIM // 32)
+    tok = jj[:, None] * 16 + torch.arange(16, device=kv_cache.device)
+    data = torch.gather(data, 1, tok[:, :, None].expand(-1, -1, HEAD_DIM // 2)).long()
+    sc = torch.gather(sc, 1, tok[:, :, None].expand(-1, -1, HEAD_DIM // 32)).float()
+    c = torch.stack([data & 15, data >> 4], -1).view(*data.shape[:2], HEAD_DIM)
+    v = E2M1[c & 7] * torch.where((c & 8) != 0, -1.0, 1.0)
+    v = v * torch.exp2(sc - 127).repeat_interleave(32, -1)
+    return v.reshape(-1, HEAD_DIM)[:n]
+
+
 def _kvp_exactness_stats(q, kv_cache, sparse_bt, sparse_ctx, scale, H, block_table,
                          seq_lens, max_seq_len, scratch, out_scalar):
     """Diagnostic (``VLLM_MXFP4_KVP_STATS=1``): on the real pages, the share of
@@ -1074,6 +1101,27 @@ def _kvp_exactness_stats(q, kv_cache, sparse_bt, sparse_ctx, scale, H, block_tab
         scratch=scratch, per_token_scales=True, _stats=False,
     )
     rel = ((out_scalar.float() - out_tok.float()).norm() / out_tok.float().norm()).item()
+    # fp32 reference over the MXFP4 pages for 64 sampled rows.
+    rows = q.shape[0]
+    group = q.shape[1] // H
+    sample = torch.linspace(0, rows - 1, 64, device=q.device).long().unique()
+    num_s = num_t = num_r = 0.0
+    for r in sample.tolist():
+        for h in range(H):
+            n = int(sparse_ctx[r * H + h])
+            if n <= 0:
+                continue
+            ent = sparse_bt[r * H + h, : triton.cdiv(n, 16)].long()
+            blk = ent // (8 * H)
+            jj = (ent // H) % 8
+            k = _deq_tokens(kv_cache, blk, jj, h, H, n, E2M1)
+            v = _deq_tokens(kv_cache, blk, jj, H + h, H, n, E2M1)
+            qh = q[r, h * group : (h + 1) * group].float()
+            ref = torch.softmax(qh @ k.T * scale, -1) @ v
+            num_s += (out_scalar[r, h * group : (h + 1) * group].float() - ref).pow(2).sum().item()
+            num_t += (out_tok[r, h * group : (h + 1) * group].float() - ref).pow(2).sum().item()
+            num_r += ref.pow(2).sum().item()
+    msg.append(f"ref_shared={(num_s / num_r) ** 0.5:.3e} ref_token={(num_t / num_r) ** 0.5:.3e}")
     _KVP_STATS["n"] += 1
     if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
         return
@@ -1125,13 +1173,15 @@ def mxfp4_sparse_attend_prefill_fp8_gfx942(
         ks, vs = scratch.ks, scratch.vs
     else:
         _side_scale_max_kernel[grid](
-            kv_cache, block_table, seq_lens, scratch.emax, kv_cache.stride(0),
+            kv_cache, block_table, seq_lens, scratch.emax, scratch.lossy,
+            kv_cache.stride(0),
             block_table.stride(0), H=H, BLOCK_TOKENS=PAGE_TOKENS,
             HALF=HEAD_DIM // 2, PAGE=PAGE_BYTES, num_warps=2,
         )  # fmt: skip
         _transcode_page16_fp8_scalar_kernel[grid](
             kv_cache, block_table, seq_lens, scratch.k, scratch.v, scratch.kv_scale,
-            scratch.emax, block_map, kv_cache.stride(0), block_table.stride(0), width,
+            scratch.emax, scratch.lossy, block_map, kv_cache.stride(0),
+            block_table.stride(0), width,
             H=H, D=HEAD_DIM, BLOCK_TOKENS=PAGE_TOKENS, PAGE=PAGE_BYTES,
             HEADROOM=SCALAR_SCALE_HEADROOM, num_warps=4,
         )  # fmt: skip
@@ -1144,6 +1194,23 @@ def mxfp4_sparse_attend_prefill_fp8_gfx942(
         q.contiguous(), scratch.k, scratch.v, ks, vs, table,
         sparse_ctx, H, scale, out, scratch,
     )  # fmt: skip
+    # Exactness guard: read after the attend is queued, so the wait overlaps
+    # work the GPU does anyway. Any inexact value redoes the call in the
+    # per-token form, whose transcode is the exact pre-existing one.
+    if not per_token_scales and bool(scratch.lossy.item()):
+        scratch.fallbacks += 1
+        if scratch.fallbacks == 1:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "MXFP4 KV prefill: K/V chunk range exceeds the shared fp8 "
+                "scale's exact window; using per-token scales for such calls."
+            )
+        return mxfp4_sparse_attend_prefill_fp8_gfx942(
+            q, kv_cache, sparse_bt, sparse_ctx, out, scale, num_kv_heads=H,
+            block_table=block_table, seq_lens=seq_lens, max_seq_len=max_seq_len,
+            scratch=scratch, per_token_scales=True, _stats=False,
+        )
     if _stats and not per_token_scales and _kvp_stats_enabled():
         _kvp_exactness_stats(q, kv_cache, sparse_bt, sparse_ctx, scale, H,
                              block_table, seq_lens, max_seq_len, scratch, out)

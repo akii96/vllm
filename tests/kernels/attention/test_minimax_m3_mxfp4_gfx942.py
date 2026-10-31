@@ -356,6 +356,30 @@ def test_prefill_fp8_shared_vs_per_token(num_kv_heads):
     assert d < 0.03, d
 
 
+def test_prefill_fp8_shared_scale_falls_back_when_inexact():
+    """A chunk more than 14 binades below the side's largest scale is not
+    exact against one shared scale: the call detects it on device and redoes
+    the attend with per-token scales, bit-identical to asking for them."""
+    from vllm.models.minimax_m3.amd.ops.mxfp4_attn_gfx942 import (
+        Mxfp4PrefillScratch,
+        mxfp4_sparse_attend_prefill_fp8_gfx942,
+    )
+
+    H = 1
+    cache, table, ctx, q, block_table, seq_lens, page16 = _prefill_case(H, 31, 100, 131)
+    scratch = Mxfp4PrefillScratch(64, H, torch.device("cuda"))
+    kw = dict(num_kv_heads=H, block_table=block_table, seq_lens=seq_lens,
+              max_seq_len=32 * BLOCK, scratch=scratch)
+    out = torch.empty_like(q)
+    assert mxfp4_sparse_attend_prefill_fp8_gfx942(q, cache, page16, ctx, out, SCALE, **kw)
+    assert scratch.fallbacks == 1
+    tok = torch.empty_like(q)
+    assert mxfp4_sparse_attend_prefill_fp8_gfx942(
+        q, cache, page16, ctx, tok, SCALE, per_token_scales=True, **kw
+    )
+    torch.testing.assert_close(out, tok, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("tokens,hq,hk,hi", [(1, 16, 1, 1), (4, 16, 1, 1), (8, 32, 2, 2)])
 def test_gfx942_qkv_index_store_matches_split_path(tokens, hq, hk, hi):
     """One-launch decode write path == main norm/RoPE + store_kv_mxfp4 +
