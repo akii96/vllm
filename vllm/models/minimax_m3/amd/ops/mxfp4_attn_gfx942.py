@@ -784,6 +784,142 @@ def _transcode_page16_fp8_kernel(
             tl.store(v_out_ptr + off, q8)
 
 
+# The fp8 page-16 scratch holds every code as ``e2m1 * 2^(e - emax + 5)``
+# against ONE power-of-two scale per side, ``2^(emax - 132)`` for the largest
+# e8m0 ``emax`` of the side's blocks: AITER's paged attention then runs in its
+# per-tensor scale mode, the form the fp8 K/V cache uses. Its per-token scale
+# mode (scale gathers, LDS staging, a value-scale max reduction and a P
+# rescale every tile) costs about 30% more per call. The largest code,
+# 6 * 2^5 = 192, stays below e4m3fnuz's 240, and a code is exact whenever its
+# chunk lies within 14 binades of ``emax`` (subnormal step 2^-10): the same
+# ~18-binade window an fp8 cache with a fixed scale has.
+SCALAR_SCALE_HEADROOM = 5
+
+
+@triton.jit
+def _side_scale_max_kernel(
+    cache_ptr,
+    bt_ptr,
+    seq_lens_ptr,
+    emax_ptr,
+    stride_cache_block,
+    stride_bt,
+    H: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    HALF: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    """``emax[side] = max`` e8m0 over every block of the requests (atomic,
+    device-side: no host round trip)."""
+    i = tl.program_id(0)
+    j = tl.program_id(1)
+    side = tl.program_id(2)
+    seq_len = tl.load(seq_lens_ptr + i)
+    if j * BLOCK_TOKENS >= seq_len:
+        return
+    blk = tl.load(bt_ptr + i.to(tl.int64) * stride_bt + j)
+    page = cache_ptr + blk.to(tl.int64) * stride_cache_block + side * PAGE
+    tok = tl.arange(0, BLOCK_TOKENS)
+    s32 = tl.load((page + BLOCK_TOKENS * HALF + tok * 4).to(tl.pointer_type(tl.int32)))
+    m = tl.maximum(
+        tl.maximum(s32 & 255, (s32 >> 8) & 255),
+        tl.maximum((s32 >> 16) & 255, (s32 >> 24) & 255),
+    )
+    tl.atomic_max(emax_ptr + (side >= H).to(tl.int32), tl.max(m, axis=0))
+
+
+@triton.jit
+def _transcode_page16_fp8_scalar_kernel(
+    cache_ptr,
+    bt_ptr,
+    seq_lens_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    kv_scale_ptr,
+    emax_ptr,
+    map_ptr,
+    stride_cache_block,
+    stride_bt,
+    width,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    PAGE: tl.constexpr,
+    HEADROOM: tl.constexpr,
+):
+    """``_transcode_page16_fp8_kernel`` against one scale per side: block
+    ``j`` of request ``i``, head slot ``side``, to e4m3fnuz page-16 pages at
+    scratch slot ``i * width + j``; ``kv_scale[side >= H] = 2^(emax - 127 -
+    HEADROOM)`` and ``map[block] = slot``."""
+    i = tl.program_id(0)
+    j = tl.program_id(1)
+    side = tl.program_id(2)
+    seq_len = tl.load(seq_lens_ptr + i)
+    if j * BLOCK_TOKENS >= seq_len:
+        return
+    blk = tl.load(bt_ptr + i.to(tl.int64) * stride_bt + j)
+    slot = (i * width + j).to(tl.int64)
+    v_side = (side >= H).to(tl.int32)
+    emax = tl.load(emax_ptr + v_side)
+    if side == 0:
+        tl.store(map_ptr + blk, slot.to(tl.int32))
+    if (i == 0) & (j == 0) & ((side == 0) | (side == H)):
+        tl.store(
+            kv_scale_ptr + v_side,
+            ((emax - HEADROOM) << 23).to(tl.float32, bitcast=True),
+        )
+    HALF: tl.constexpr = D // 2
+    tok = tl.arange(0, BLOCK_TOKENS)
+    col = tl.arange(0, HALF)
+    page = cache_ptr + blk.to(tl.int64) * stride_cache_block + side * PAGE
+    raw = tl.load(page + tok[:, None] * HALF + col[None, :]).to(tl.int32)
+    s32 = tl.load((page + BLOCK_TOKENS * HALF + tok * 4).to(tl.pointer_type(tl.int32)))
+    e = (s32[:, None] >> ((col[None, :] // 16) * 8)) & 255
+    step = tl.exp2((e - emax + HEADROOM).to(tl.float32))
+    h = side % H
+    pg = slot * (BLOCK_TOKENS // 16) + tok // 16
+    t16 = tok % 16
+    for par in tl.static_range(2):
+        d = 2 * col + par
+        n = (raw >> (4 * par)) & 15
+        m = n & 7
+        # e2m1 magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6
+        mag = tl.where(
+            m < 4,
+            m.to(tl.float32) * 0.5,
+            tl.where(m < 6, (m - 2).to(tl.float32), (2 * m - 8).to(tl.float32)),
+        )
+        # -0 stays +0: e4m3fnuz 0x80 is NaN.
+        val = tl.where(((n & 8) != 0) & (m != 0), -mag, mag) * step
+        q8 = val.to(tl.float8e4b8)
+        if side < H:
+            off = (
+                ((pg[:, None] * H + h) * (D // 16) + d[None, :] // 16) * 256
+                + t16[:, None] * 16
+                + d[None, :] % 16
+            )
+            tl.store(k_out_ptr + off, q8)
+        else:
+            off = ((pg[:, None] * H + h) * D + d[None, :]) * 16 + t16[:, None]
+            tl.store(v_out_ptr + off, q8)
+
+
+@triton.jit
+def _remap_table_reset_kernel(
+    bt_ptr, out_ptr, map_ptr, emax_ptr, n, PER_BLOCK: tl.constexpr, BLK: tl.constexpr
+):
+    """``_remap_table_kernel`` that also clears ``emax`` for the next call
+    (the transcode that read it has finished: same stream)."""
+    pid = tl.program_id(0)
+    off = pid * BLK + tl.arange(0, BLK)
+    m = off < n
+    e = tl.load(bt_ptr + off, mask=m, other=0)
+    slot = tl.load(map_ptr + e // PER_BLOCK, mask=m, other=0)
+    tl.store(out_ptr + off, slot * PER_BLOCK + e % PER_BLOCK, mask=m)
+    if pid == 0:
+        tl.store(emax_ptr + tl.arange(0, 2), tl.zeros([2], dtype=tl.int32))
+
+
 class Mxfp4PrefillScratch:
     """Persistent scratch for the prefill transcode, shared by every layer of
     a device (layers run one after another). Created when the attention impl
@@ -803,6 +939,29 @@ class Mxfp4PrefillScratch:
         self.vs = torch.empty((pages * H, 1, 16, 1), dtype=torch.float32, device=device)
         self.block_map: torch.Tensor | None = None
         self.table: torch.Tensor | None = None
+        # [K, V] largest e8m0 (zero between calls) and the scalar scales.
+        self.emax = torch.zeros(2, dtype=torch.int32, device=device)
+        self.kv_scale = torch.ones(2, dtype=torch.float32, device=device)
+        self.partials: tuple | None = None
+
+    def partials_for(self, shape, dtype, device):
+        """exp_sums / max_logits / temporary output, grown on demand."""
+        n = 1
+        for x in shape:
+            n *= x
+        cur = self.partials
+        if cur is None or cur[0].numel() < n or cur[2].dtype != dtype:
+            cur = (
+                torch.empty(n, dtype=torch.float32, device=device),
+                torch.empty(n, dtype=torch.float32, device=device),
+                torch.empty(n * HEAD_DIM, dtype=dtype, device=device),
+            )
+            self.partials = cur
+        return (
+            cur[0][:n].view(shape),
+            cur[1][:n].view(shape),
+            cur[2][: n * HEAD_DIM].view(*shape, HEAD_DIM),
+        )
 
     @classmethod
     def get(cls, capacity_blocks: int, num_kv_heads: int, device: torch.device):
@@ -825,7 +984,9 @@ class Mxfp4PrefillScratch:
         return self.table[:n].view(like.shape)
 
 
-def _gluon_sparse_pa_fp8_token_scales(q, k, v, ks, vs, table, ctx, H, scale, out):
+def _gluon_sparse_pa_fp8_token_scales(
+    q, k, v, ks, vs, table, ctx, H, scale, out, scratch=None
+):
     """AITER's gluon sparse paged attention over fp8 page-16 pages with
     per-token K/V scales; pages hold one KV head each (``page * H + h``)."""
     from aiter.ops.triton.gluon.pa_decode_gluon import (
@@ -843,9 +1004,14 @@ def _gluon_sparse_pa_fp8_token_scales(q, k, v, ks, vs, table, ctx, H, scale, out
     num_seqs = total_q * H
     parts = get_recommended_splits(num_seqs, 1)
     shape = (num_seqs, 1, parts, group)
-    exp_sums = torch.empty(shape, dtype=torch.float32, device=q.device)
-    max_logits = torch.empty_like(exp_sums)
-    tmp = torch.empty(*shape, head_size, dtype=q.dtype, device=q.device)
+    if scratch is not None:
+        exp_sums, max_logits, tmp = scratch.partials_for(shape, q.dtype, q.device)
+    else:
+        exp_sums = torch.empty(shape, dtype=torch.float32, device=q.device)
+        max_logits = torch.empty_like(exp_sums)
+        tmp = torch.empty(*shape, head_size, dtype=q.dtype, device=q.device)
+    if ks.numel() > 1:
+        ks, vs = ks[:npages], vs[:npages]
     pa_decode_gluon(
         output=out_view,
         query=q_view,
@@ -859,8 +1025,8 @@ def _gluon_sparse_pa_fp8_token_scales(q, k, v, ks, vs, table, ctx, H, scale, out
         context_partition_size=256,
         compute_type=torch.float8_e4m3fnuz,
         query_scale=None,
-        key_scale=ks[:npages],
-        value_scale=vs[:npages],
+        key_scale=ks,
+        value_scale=vs,
         exp_sums=exp_sums,
         max_logits=max_logits,
         temporary_output=tmp,
@@ -869,6 +1035,50 @@ def _gluon_sparse_pa_fp8_token_scales(q, k, v, ks, vs, table, ctx, H, scale, out
         sliding_window=-1,
         ps=True,
     )
+
+
+_KVP_STATS = {"n": 0}
+
+
+def _kvp_exactness_stats(q, kv_cache, sparse_bt, sparse_ctx, scale, H, block_table,
+                         seq_lens, max_seq_len, scratch, out_scalar):
+    """Diagnostic (``VLLM_MXFP4_KVP_STATS=1``): on the real pages, the share of
+    nonzero values each transcode does not hold exactly, and the attend's
+    rel-L2 between the shared-scale and per-token-scale forms."""
+    import os
+
+    E2M1 = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6], device=q.device)
+    blocks = torch.cat([block_table[i, : triton.cdiv(int(seq_lens[i]), PAGE_TOKENS)]
+                        for i in range(block_table.shape[0])]).long()
+    pages = kv_cache[blocks].view(blocks.numel(), 2 * H, PAGE_BYTES)
+    data = pages[..., : PAGE_TOKENS * HEAD_DIM // 2].view(-1, 2 * H, PAGE_TOKENS, HEAD_DIM // 2)
+    e = pages[..., PAGE_TOKENS * HEAD_DIM // 2 :].view(-1, 2 * H, PAGE_TOKENS, 4).int()
+    codes = torch.stack([data & 15, data >> 4], -1).view(-1, 2 * H, PAGE_TOKENS, HEAD_DIM).long()
+    mag = E2M1[codes & 7]
+    ech = e.repeat_interleave(32, -1)
+    nz = mag != 0
+    msg = []
+    for side, name in ((slice(0, H), "K"), (slice(H, 2 * H), "V")):
+        m, ec, z = mag[:, side], ech[:, side], nz[:, side]
+        emax = int(e[:, side].max())
+        tmax = e[:, side].amax(-1, keepdim=True)
+        for label, ref in (("shared", emax - SCALAR_SCALE_HEADROOM), ("token", tmax)):
+            v = m * torch.exp2((ec - ref).float())
+            bad = (v.to(torch.float8_e4m3fnuz).float() != v) & z
+            msg.append(f"{name}.{label}_lossy={int(bad.sum())}/{int(z.sum())}")
+        msg.append(f"{name}.erange={int(e[:, side].min())}..{emax}")
+    out_tok = torch.empty_like(out_scalar)
+    mxfp4_sparse_attend_prefill_fp8_gfx942(
+        q, kv_cache, sparse_bt, sparse_ctx, out_tok, scale, num_kv_heads=H,
+        block_table=block_table, seq_lens=seq_lens, max_seq_len=max_seq_len,
+        scratch=scratch, per_token_scales=True, _stats=False,
+    )
+    rel = ((out_scalar.float() - out_tok.float()).norm() / out_tok.float().norm()).item()
+    _KVP_STATS["n"] += 1
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    print(f"[kvp-stats] call={_KVP_STATS['n']} rows={q.shape[0]} ctx={max_seq_len} "
+          f"relL2={rel:.3e} " + " ".join(msg), flush=True)
 
 
 def mxfp4_sparse_attend_prefill_fp8_gfx942(
@@ -884,10 +1094,15 @@ def mxfp4_sparse_attend_prefill_fp8_gfx942(
     seq_lens: torch.Tensor,  # [reqs]
     max_seq_len: int,
     scratch: Mxfp4PrefillScratch,
+    per_token_scales: bool = False,
+    _stats: bool = True,
 ) -> bool:
     """Prefill attend: transcode every block of the rows' requests once to
     e4m3fnuz page-16 pages with per-token power-of-two scales, then run AITER's
     sparse paged attention in fp8 -- the kernel the fp8 K/V cache uses.
+    By default the pages share one power-of-two scale per side (device-side
+    max, no host sync), so the attend runs AITER's per-tensor scale mode like
+    the fp8 cache; ``per_token_scales`` keeps the older per-token form.
     Returns False (doing nothing) if the requests exceed the scratch."""
     H = num_kv_heads
     reqs = block_table.shape[0]
@@ -895,21 +1110,50 @@ def mxfp4_sparse_attend_prefill_fp8_gfx942(
     if reqs * width > scratch.capacity_blocks:
         return False
     block_map = scratch.map_for(kv_cache.shape[0], q.device)
-    _transcode_page16_fp8_kernel[(reqs, width, 2 * H)](
-        kv_cache, block_table, seq_lens, scratch.k, scratch.v, scratch.ks,
-        scratch.vs, block_map, kv_cache.stride(0), block_table.stride(0), width,
-        H=H, D=HEAD_DIM, BLOCK_TOKENS=PAGE_TOKENS, PAGE=PAGE_BYTES, num_warps=4,
-    )  # fmt: skip
     table = scratch.table_for(sparse_bt)
     n = sparse_bt.numel()
-    _remap_table_kernel[(triton.cdiv(n, 1024),)](
-        sparse_bt, table, block_map, n, PER_BLOCK=(PAGE_TOKENS // 16) * H, BLK=1024
-    )
+    grid = (reqs, width, 2 * H)
+    if per_token_scales:
+        _transcode_page16_fp8_kernel[grid](
+            kv_cache, block_table, seq_lens, scratch.k, scratch.v, scratch.ks,
+            scratch.vs, block_map, kv_cache.stride(0), block_table.stride(0), width,
+            H=H, D=HEAD_DIM, BLOCK_TOKENS=PAGE_TOKENS, PAGE=PAGE_BYTES, num_warps=4,
+        )  # fmt: skip
+        _remap_table_kernel[(triton.cdiv(n, 1024),)](
+            sparse_bt, table, block_map, n, PER_BLOCK=(PAGE_TOKENS // 16) * H, BLK=1024
+        )
+        ks, vs = scratch.ks, scratch.vs
+    else:
+        _side_scale_max_kernel[grid](
+            kv_cache, block_table, seq_lens, scratch.emax, kv_cache.stride(0),
+            block_table.stride(0), H=H, BLOCK_TOKENS=PAGE_TOKENS,
+            HALF=HEAD_DIM // 2, PAGE=PAGE_BYTES, num_warps=2,
+        )  # fmt: skip
+        _transcode_page16_fp8_scalar_kernel[grid](
+            kv_cache, block_table, seq_lens, scratch.k, scratch.v, scratch.kv_scale,
+            scratch.emax, block_map, kv_cache.stride(0), block_table.stride(0), width,
+            H=H, D=HEAD_DIM, BLOCK_TOKENS=PAGE_TOKENS, PAGE=PAGE_BYTES,
+            HEADROOM=SCALAR_SCALE_HEADROOM, num_warps=4,
+        )  # fmt: skip
+        _remap_table_reset_kernel[(triton.cdiv(n, 1024),)](
+            sparse_bt, table, block_map, scratch.emax, n,
+            PER_BLOCK=(PAGE_TOKENS // 16) * H, BLK=1024,
+        )  # fmt: skip
+        ks, vs = scratch.kv_scale[0:1], scratch.kv_scale[1:2]
     _gluon_sparse_pa_fp8_token_scales(
-        q.contiguous(), scratch.k, scratch.v, scratch.ks, scratch.vs, table,
-        sparse_ctx, H, scale, out,
+        q.contiguous(), scratch.k, scratch.v, ks, vs, table,
+        sparse_ctx, H, scale, out, scratch,
     )  # fmt: skip
+    if _stats and not per_token_scales and _kvp_stats_enabled():
+        _kvp_exactness_stats(q, kv_cache, sparse_bt, sparse_ctx, scale, H,
+                             block_table, seq_lens, max_seq_len, scratch, out)
     return True
+
+
+def _kvp_stats_enabled() -> bool:
+    import os
+
+    return os.environ.get("VLLM_MXFP4_KVP_STATS", "0") == "1"
 
 def mxfp4_sparse_attend_prefill_gfx942(
     q: torch.Tensor,  # [rows, Hq, 128] bf16

@@ -213,6 +213,10 @@ class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
             raise ValueError(f"MiniMax M3 MXFP4 KV cache on ROCm {reason}")
         self.is_gfx942 = _mxfp4_attention_arch() == "gfx942"
         self.prefill_scratch = None
+        # VLLM_MXFP4_KVP_PER_TOKEN=1: the older per-token-scale prefill attend.
+        self.prefill_per_token_scales = (
+            os.environ.get("VLLM_MXFP4_KVP_PER_TOKEN", "0") == "1"
+        )
         if self.is_gfx942:
             from vllm.config import get_current_vllm_config
             from vllm.models.minimax_m3.amd.ops.mxfp4_attn_gfx942 import (
@@ -331,6 +335,7 @@ class MiniMaxM3SparseRocmMxfp4Impl(MiniMaxM3SparseImpl):
                 sparse_ctx[nd * kvh : num_tokens * kvh], out[nd:], self.scale,
                 num_kv_heads=kvh, block_table=p.block_table, seq_lens=p.seq_lens,
                 max_seq_len=p.max_seq_len, scratch=self.prefill_scratch,
+                per_token_scales=self.prefill_per_token_scales,
             ):  # fmt: skip
                 num_tokens = nd
         if num_tokens > 0:

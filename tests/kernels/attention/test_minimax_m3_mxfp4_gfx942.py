@@ -270,6 +270,92 @@ def test_prefill_fp8_transcode(num_kv_heads):
     )
 
 
+def _prefill_case(H, seed, scale_lo=118, scale_hi=130):
+    causal_lens = [300, 2048, 5000, 129]
+    rows = len(causal_lens)
+    num_pages = 64
+    cache, table, ctx, q = _case(rows, H, causal_lens, num_pages, seed=seed)
+    if (scale_lo, scale_hi) != (118, 130):
+        _, sc = mxfp4_page_views(cache.view(num_pages, 2 * H, PAGE_BYTES))
+        g = torch.Generator(device="cuda").manual_seed(seed + 1)
+        sc.copy_(torch.randint(scale_lo, scale_hi, sc.shape, dtype=torch.uint8,
+                               device="cuda", generator=g))
+    block_table = torch.randperm(num_pages, device="cuda").int().view(2, 32)
+    seq_lens = torch.full((2,), 32 * BLOCK, dtype=torch.int32, device="cuda")
+    j = torch.arange(8, device="cuda", dtype=torch.int32)
+    page16 = torch.zeros(rows * H, TOPK * 8, dtype=torch.int32, device="cuda")
+    for row in range(rows * H):
+        page16[row] = ((table[row, :, None] * 8 + j) * H + row % H).flatten()
+    return cache, table, ctx, q, block_table, seq_lens, page16
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+def test_prefill_fp8_shared_scale_transcode_exact(num_kv_heads):
+    """The shared-scale transcode holds every MXFP4 value exactly (chunks
+    within 14 binades of the side's largest e8m0): scratch * kv_scale equals
+    the dequantized pages, and the scale is written on device."""
+    from vllm.models.minimax_m3.amd.ops.mxfp4_attn_gfx942 import (
+        Mxfp4PrefillScratch,
+        mxfp4_sparse_attend_prefill_fp8_gfx942,
+    )
+
+    H = num_kv_heads
+    cache, table, ctx, q, block_table, seq_lens, page16 = _prefill_case(H, 23, 116, 131)
+    scratch = Mxfp4PrefillScratch(64, H, torch.device("cuda"))
+    out = torch.empty_like(q)
+    assert mxfp4_sparse_attend_prefill_fp8_gfx942(
+        q, cache, page16, ctx, out, SCALE, num_kv_heads=H,
+        block_table=block_table, seq_lens=seq_lens, max_seq_len=32 * BLOCK,
+        scratch=scratch,
+    )
+    assert int(scratch.emax.abs().sum()) == 0  # reset for the next call
+    pages = cache.view(cache.shape[0], 2 * H, PAGE_BYTES)
+    ks, vs = scratch.kv_scale.tolist()
+    for i in range(2):
+        for jb in range(32):
+            blk = int(block_table[i, jb])
+            slot = i * 32 + jb
+            for h in range(H):
+                kref = dequantize_pages(pages[blk : blk + 1, h]).reshape(BLOCK, D)
+                vref = dequantize_pages(pages[blk : blk + 1, H + h]).reshape(BLOCK, D)
+                k8 = scratch.k[slot * 8 : slot * 8 + 8, h].float()  # [8, D/16, 16, 16]
+                k = k8.permute(0, 2, 1, 3).reshape(BLOCK, D) * ks
+                v8 = scratch.v[slot * 8 : slot * 8 + 8, h, 0].float()  # [8, D, 16]
+                v = v8.permute(0, 2, 1).reshape(BLOCK, D) * vs
+                assert torch.equal(k, kref)
+                assert torch.equal(v, vref)
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+def test_prefill_fp8_shared_vs_per_token(num_kv_heads):
+    """Shared-scale (default) and per-token-scale attends both track fp32
+    attention over the MXFP4 pages to fp8-compute accuracy, and agree."""
+    from vllm.models.minimax_m3.amd.ops.mxfp4_attn_gfx942 import (
+        Mxfp4PrefillScratch,
+        mxfp4_sparse_attend_prefill_fp8_gfx942,
+    )
+
+    H = num_kv_heads
+    cache, table, ctx, q, block_table, seq_lens, page16 = _prefill_case(H, 29)
+    scratch = Mxfp4PrefillScratch(64, H, torch.device("cuda"))
+    ref = _reference(q, cache, table, ctx, H)
+    outs = []
+    for per_token in (False, True, False):
+        out = torch.empty_like(q)
+        assert mxfp4_sparse_attend_prefill_fp8_gfx942(
+            q, cache, page16, ctx, out, SCALE, num_kv_heads=H,
+            block_table=block_table, seq_lens=seq_lens, max_seq_len=32 * BLOCK,
+            scratch=scratch, per_token_scales=per_token,
+        )
+        err = (out.float() - ref).norm() / ref.norm()
+        assert err < 0.08, (per_token, err)
+        outs.append(out)
+    # Repeat calls (emax reset on device) are deterministic.
+    torch.testing.assert_close(outs[0], outs[2], rtol=0, atol=0)
+    d = (outs[0].float() - outs[1].float()).norm() / outs[1].float().norm()
+    assert d < 0.03, d
+
+
 @pytest.mark.parametrize("tokens,hq,hk,hi", [(1, 16, 1, 1), (4, 16, 1, 1), (8, 32, 2, 2)])
 def test_gfx942_qkv_index_store_matches_split_path(tokens, hq, hk, hi):
     """One-launch decode write path == main norm/RoPE + store_kv_mxfp4 +
