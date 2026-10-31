@@ -53,6 +53,14 @@ def expand_block_table_page64_into(
         raise ValueError(
             f"page table {tuple(out.shape)} too small for {batch}x{blocks}"
         )
+    if not block_table.is_cuda:
+        pages = out[:batch, : KERNEL_PAGES_PER_BLOCK * blocks]
+        for p in range(KERNEL_PAGES_PER_BLOCK):
+            col = pages[:, p::KERNEL_PAGES_PER_BLOCK]
+            torch.mul(block_table, KERNEL_PAGES_PER_BLOCK, out=col)
+            if p:
+                col.add_(p)
+        return out[:batch]
     if batch and blocks:
         # One launch (this runs on the host every decode step, outside the
         # captured graph; the torch version was 3 launches, ~30 us).
