@@ -7,7 +7,8 @@ kernel launch there pays ``JITFunction.run``'s host-side argument binding,
 specialization and cache-key build (~30-60 us) for each of the 60 layers per
 step. A launch whose tensors are the same persistent buffers (same pointers,
 shapes and strides) and whose scalars are unchanged binds identically, so the
-compiled kernel and its bound argument list can be replayed directly. The\nconstexpr `kwargs` are assumed fixed for a given kernel, grid and arguments.
+compiled kernel and its bound argument list can be replayed directly. The
+constexpr `kwargs` are assumed fixed for a given kernel, grid and arguments.
 """
 
 from collections.abc import Callable, Sequence
@@ -31,8 +32,11 @@ class _Ptr:
 
     def data_ptr(self) -> int:
         return self.ptr
-_MAX_ENTRIES = 4096
 
+
+# Bounded: keys include buffer addresses, so a workload whose per-step buffers
+# move would otherwise grow the cache without limit.
+_MAX_ENTRIES = 4096
 
 
 def launch_cached(
@@ -77,4 +81,6 @@ def launch_cached(
 
         _CALLS[key] = (replay, values)
     except Exception:  # noqa: BLE001 - other Triton internals: stay on the JIT path
-        _CALLS[key] = (lambda _: kernel[tuple(grid)](*args, **kwargs), None)
+        # Do not cache a closure over ``args``: it would keep the tensors
+        # (and their memory) alive. The next call simply takes the JIT path.
+        pass
