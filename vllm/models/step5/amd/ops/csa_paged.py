@@ -197,6 +197,9 @@ def sparse_attention_paged(
         BLOCK_D=triton.next_power_of_2(head_dim),
         # 8 regions x 8 tokens x 256 padded dims fits gfx942's 64 KiB LDS.
         BLOCK_S=8,
+        # One wave owns all heads of a group: softmax row reductions stay
+        # in-wave, and four independent gathers run per gfx942 CU instead of two.
+        num_warps=1,
         num_stages=1,
         FP8=fp8,
     )
