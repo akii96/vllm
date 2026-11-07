@@ -961,6 +961,15 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
         self.matched_count = self.patterns.apply(graph)
+        if (
+            self.matched_count == 0
+            and self.config.model_config is not None
+            and self.config.model_config.architecture == "FlintForCausalLM"
+        ):
+            raise RuntimeError(
+                "Flint QK-Norm+RoPE+KVCache fusion was enabled but replaced no "
+                "production graph patterns"
+            )
         logger.info(
             "QK-Norm+RoPE/MRoPE+KVCache fusion: replaced %s pattern(s) "
             "with an AITER fused attention-prologue kernel",

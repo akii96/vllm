@@ -1055,6 +1055,9 @@ def test_qk_norm_rope_kvcache_fusion_interleaves_every_layer(
             )
             for i in range(3)
         ]
+        # Flint mixes RoPE and no-RoPE layers. The latter still shares the KV
+        # cache layout selected by the fused writer in the former.
+        models[1].rotary_emb = None
         QkNormRopeKvCacheFusionPass(vllm_config)
 
     from vllm.v1.attention.backends.rocm_attn import RocmAttentionImpl

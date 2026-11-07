@@ -283,6 +283,18 @@ def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
     return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
 
 
+def enable_flint_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
+    """Enable Flint's packed-QKV preparation fusion at the default O1 level."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    model_config = cfg.model_config
+    return (
+        rocm_aiter_ops.is_enabled()
+        and model_config is not None
+        and model_config.architecture == "FlintForCausalLM"
+        and cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
+    )
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -314,7 +326,7 @@ OPTIMIZATION_LEVEL_01 = {
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": False,
-            "fuse_qk_norm_rope_kvcache": False,
+            "fuse_qk_norm_rope_kvcache": enable_flint_qk_norm_rope_kvcache,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
         },

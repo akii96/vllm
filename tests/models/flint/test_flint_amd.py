@@ -8,7 +8,14 @@ import pytest
 import torch
 
 import vllm.models.flint.amd.model as flint_amd_model
-from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
+from vllm._aiter_ops import rocm_aiter_ops
+from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+from vllm.config import (
+    ModelConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
+from vllm.config.vllm import OptimizationLevel
 from vllm.config.load import LoadConfig
 from vllm.config.quantization import QuantizationConfigArgs
 from vllm.forward_context import set_forward_context
@@ -30,7 +37,13 @@ from vllm.platforms import current_platform
 pytestmark = pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only test")
 
 
-def _tiny_vllm_config(tmp_path, *, quant_config=None):
+def _tiny_vllm_config(
+    tmp_path,
+    *,
+    quant_config=None,
+    optimization_level=None,
+    compilation_config=None,
+):
     config = {
         "architectures": ["FlintForCausalLM"],
         "model_type": "flint",
@@ -58,11 +71,50 @@ def _tiny_vllm_config(tmp_path, *, quant_config=None):
         max_model_len=128,
         skip_tokenizer_init=True,
     )
+    kwargs = {}
+    if optimization_level is not None:
+        kwargs["optimization_level"] = optimization_level
+    if compilation_config is not None:
+        kwargs["compilation_config"] = compilation_config
     return VllmConfig(
         model_config=model_config,
         load_config=LoadConfig(load_format="dummy"),
         quant_config=quant_config,
+        **kwargs,
     )
+
+
+def test_flint_amd_model_is_a_production_torch_compile_boundary():
+    assert issubclass(flint_amd_model.FlintModel, TorchCompileWithNoGuardsWrapper)
+
+
+def test_flint_amd_o1_enables_qk_norm_rope_kvcache_fusion(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
+    rocm_aiter_ops.refresh_env_variables()
+    vllm_config = _tiny_vllm_config(
+        tmp_path, optimization_level=OptimizationLevel.O1
+    )
+
+    assert vllm_config.compilation_config.pass_config.fuse_qk_norm_rope_kvcache
+    assert vllm_config.compilation_config.use_inductor_graph_partition
+    assert "+rotary_embedding" in vllm_config.compilation_config.custom_ops
+
+
+def test_flint_amd_o1_respects_disabled_rotary_embedding(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
+    rocm_aiter_ops.refresh_env_variables()
+    vllm_config = _tiny_vllm_config(
+        tmp_path,
+        optimization_level=OptimizationLevel.O1,
+        compilation_config={"custom_ops": ["-rotary_embedding"]},
+    )
+
+    assert not vllm_config.compilation_config.pass_config.fuse_qk_norm_rope_kvcache
+    assert not vllm_config.compilation_config.use_inductor_graph_partition
+    assert "-rotary_embedding" in vllm_config.compilation_config.custom_ops
+    assert "+rotary_embedding" not in vllm_config.compilation_config.custom_ops
 
 
 def test_flint_amd_tiny_model_initializes_with_dummy_weights(tmp_path, dist_init):
